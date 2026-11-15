@@ -1,0 +1,125 @@
+--- a/frontend/src/utils/voiceIntent.ts
++++ b/frontend/src/utils/voiceIntent.ts
+@@ -20,19 +20,26 @@
+     .replace(/\s+/g, ' ')
+     .trim();
+ 
+-const stripPolitePrefix = (text: string): string =>
+-  text
+-    .replace(/^(?:(?:hey|hi|ok|okay)\s+)?oracle(?:\s+|$)/i, '')
+-    .replace(/^(?:(?:please|can you|could you|would you)\s+)+/i, '')
+-    .replace(/\s+please$/i, '')
+-    .trim();
++// Remove only explicit address/politeness wrappers; never guess the destination.
++export function normalizeVoiceCommand(text: string): string {
++  let command = normalize(text);
++  let previous: string;
++  do {
++    previous = command;
++    command = command
++      .replace(/^(?:(?:hey|hi|ok|okay)\s+)?oracle(?:\s+|$)/, '')
++      .replace(/^(?:please|can you|could you|would you)\s+/, '')
++      .replace(/\s+please$/, '').trim();
++  } while (command !== previous);
++  return command;
++}
+ 
+ const commands = [
+   ['open_map', /^(?:(?:open|show|display|launch|view|activate|enter|bring up) )?(?:the )?(?:tactical )?(?:geo )?(?:map|maps|atlas|spatial intelligence)(?: (?:view|mode))?$/],
+   ['close_map', /^(?:close|hide|exit|minimize) (?:the )?(?:tactical )?(?:geo )?(?:map|maps|atlas)$/],
+-  ['open_settings', /^(?:open|show|display|launch|view) (?:the )?(?:system )?settings$/],
+-  ['open_camera', /^(?:open|show|start|turn on) (?:the )?camera$/],
+-  ['close_camera', /^(?:close|stop|turn off) (?:the )?camera$/],
++  ['open_settings', /^(?:open|show|display|launch|view|bring up) (?:the )?(?:system )?settings$/],
++  ['open_camera', /^(?:open|show|start|turn on|enable) (?:the )?camera$/],
++  ['close_camera', /^(?:close|stop|turn off|disable) (?:the )?camera$/],
+ ] as const;
+ 
+ export const commandEvents = {
+@@ -45,7 +52,7 @@
+ 
+ export function interpretVoiceIntent(text: string): VoiceIntent {
+   const normalizedText = normalize(text);
+-  const command = stripPolitePrefix(normalizedText);
++  const command = normalizeVoiceCommand(normalizedText);
+ 
+   const match = commands.find(([, pattern]) => pattern.test(command));
+   if (match) {
+--- a/frontend/src/components/ConversationHUD.tsx
++++ b/frontend/src/components/ConversationHUD.tsx
+@@ -31,7 +31,7 @@
+   SileroVoiceDetector,
+   transcribeAudioBlob
+ } from '../utils/voice';
+-import { commandEvents, interpretVoiceIntent } from '../utils/voiceIntent';
++import { commandEvents, interpretVoiceIntent, normalizeVoiceCommand } from '../utils/voiceIntent';
+ import { changeTaughtCommand, findTaughtCommand, isPetLaunchCommand, parseTeachingRequest, taughtActionLabels, type TaughtCommand } from '../utils/taughtCommands';
+ import { recordCommandAttempt, updateCommandOutcome } from '../utils/commandHistory';
+ import { readReplyPreferences } from '../utils/replyPreferences';
+@@ -367,8 +367,9 @@
+       const transcript = voiceTranscript ?? (queryText === undefined ? draftTranscript.current : undefined);
+       if (queryText === undefined) draftTranscript.current = undefined;
+       const normPrompt = textToSend.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+-      const systemCommand = normPrompt.replace(/^(?:(?:hey|ok|okay) )?oracle\s+|^hey\s+/, '')
+-        .replace(/^(?:please |(?:can|could) you )/, '');
++      const systemCommand = normalizeVoiceCommand(textToSend);
++      // Local actions return before the chat request's state cleanup.
++      if (!isGeneratingRef.current) setMode('ready');
+       if (/^(?:(?:initiate|activate|enter|start) (?:the )?)?(?:protocol hibernate|hibernate protocol|hibernate(?: system)?|low activity)$/.test(systemCommand)) {
+         setInput('');
+         executeProtocol('hibernate', hasAdminGrant());
+@@ -408,7 +409,7 @@
+           return;
+         }
+       }
+-      const cameraCommand = /^(?:(?:hey |okay |ok )?oracle )?(?:please )?(expand camera|collapse camera|show product details|hide product details|pin this result|unpin result|read the label|what size is this|show scan evidence)$/.exec(normPrompt)?.[1];
++      const cameraCommand = /^(?:(?:hey |okay |ok )?oracle )?(?:please )?(expand camera|collapse camera|show product details|hide product details|pin this result|unpin result|read the label|what size is this|show scan evidence)$/.exec(systemCommand)?.[1];
+       if (cameraCommand) {
+         const actions: Record<string, string> = {
+           'expand camera': 'expand', 'collapse camera': 'collapse',
+@@ -465,7 +466,7 @@
+         p.voicePhrases.some(phrase => {
+           const clean = phrase.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+           if (!clean) return false;
+-          if (normPrompt === clean || normPrompt === `please ${clean}` || normPrompt === `oracle ${clean}`) return true;
++          if (systemCommand === clean) return true;
+           if (clean.includes(' ')) return false;
+           // For single keyword phrases (e.g. "focus", "admin"), only match deliberate action commands
+           const commandPatterns = [
+@@ -473,7 +474,7 @@
+             `start ${clean}`, `start protocol ${clean}`, `run ${clean}`, `run protocol ${clean}`,
+             `open ${clean}`, `open protocol ${clean}`, `launch ${clean}`, `trigger ${clean}`
+           ];
+-          return commandPatterns.some(cmd => normPrompt === cmd || normPrompt === `please ${cmd}` || normPrompt === `oracle ${cmd}`);
++          return commandPatterns.some(cmd => systemCommand === cmd);
+         })
+       );
+       if (matchedProto) {
+@@ -492,12 +493,12 @@
+         window.dispatchEvent(new CustomEvent('oracle_atlas_command', { detail: textToSend }));
+         return;
+       }
+-      if (/^(?:please\s+)?(?:open|show|launch|view)?\s*(?:the\s+)?(?:workspace|records)$/i.test(normPrompt)) {
++      if (/^(?:please\s+)?(?:open|show|launch|view)?\s*(?:the\s+)?(?:workspace|records)$/i.test(systemCommand)) {
+         setInput('');
+         onOpenRecords?.();
+         return;
+       }
+-      if (/^(?:please\s+)?(?:run|start|open|launch|execute|perform|begin)?\s*(?:a\s+)?(?:system\s+)?(?:self\s*diagnostic|diagnostics)$/i.test(normPrompt)) {
++      if (/^(?:please\s+)?(?:run|start|open|launch|execute|perform|begin)?\s*(?:a\s+)?(?:system\s+)?(?:self\s*diagnostic|diagnostics)$/i.test(systemCommand)) {
+         setInput('');
+         window.dispatchEvent(new CustomEvent('oracle_open_self_diagnostic'));
+         return;
+--- a/backend/app/live_answers.py
++++ b/backend/app/live_answers.py
+@@ -351,6 +351,10 @@
+ 
+ def correct_question(text):
+     query = normalize_question(text)
++    # Action commands must retain their wording, even when they resemble a question typo.
++    action_query = re.sub(r'^(?:(?:can|could|would) you |please )+', '', query, flags=re.I)
++    if re.match(r'^(?:open|close|launch|start|stop|activate|deactivate|enable|disable|hide|exit|minimize|run|show|display|view|enter|bring up|turn on|turn off)\b', action_query, re.I):
++        return text
+     if len(query) > 160:
+         return text
+     tokens = query.split()

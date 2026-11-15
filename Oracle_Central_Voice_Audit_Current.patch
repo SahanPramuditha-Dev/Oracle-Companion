@@ -1,0 +1,302 @@
+--- a/frontend/src/components/ConversationHUD.tsx
++++ b/frontend/src/components/ConversationHUD.tsx
+@@ -31,7 +31,7 @@
+   SileroVoiceDetector,
+   transcribeAudioBlob
+ } from '../utils/voice';
+-import { commandEvents, interpretVoiceIntent } from '../utils/voiceIntent';
++import { commandEvents, interpretVoiceIntent, normalizeVoiceCommand } from '../utils/voiceIntent';
+ import { changeTaughtCommand, findTaughtCommand, isPetLaunchCommand, parseTeachingRequest, taughtActionLabels, type TaughtCommand } from '../utils/taughtCommands';
+ import { recordCommandAttempt, updateCommandOutcome } from '../utils/commandHistory';
+ import { readReplyPreferences } from '../utils/replyPreferences';
+@@ -362,13 +362,13 @@
+   // Send message (Chat or Vision Q&A)
+   const handleSend = useCallback(
+     async (queryText?: string, voiceTranscript?: string) => {
+-      const textToSend = (queryText || input).trim();
++      const textToSend = (queryText ?? input).trim();
+       if (document.body.classList.contains('oracle-privacy-mode')) return;
+       const transcript = voiceTranscript ?? (queryText === undefined ? draftTranscript.current : undefined);
+       if (queryText === undefined) draftTranscript.current = undefined;
+-      const normPrompt = textToSend.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+-      const systemCommand = normPrompt.replace(/^(?:(?:hey|ok|okay) )?oracle\s+|^hey\s+/, '')
+-        .replace(/^(?:please |(?:can|could) you )/, '');
++      const systemCommand = normalizeVoiceCommand(textToSend);
++      // Local actions return before the chat request's state cleanup.
++      if (voiceTranscript !== undefined && !isGeneratingRef.current) setMode('ready');
+       if (/^(?:(?:initiate|activate|enter|start) (?:the )?)?(?:protocol hibernate|hibernate protocol|hibernate(?: system)?|low activity)$/.test(systemCommand)) {
+         setInput('');
+         executeProtocol('hibernate', hasAdminGrant());
+@@ -396,19 +396,19 @@
+         return;
+       }
+       if (actionRef.current && textToSend) {
+-        const lower = textToSend.toLowerCase().replace(/[^a-z]/g, '');
+-        if (['confirm', 'yes', 'confirmlaunch', 'doit', 'proceed', 'open', 'launch'].includes(lower)) {
++        const lower = systemCommand;
++        if (['confirm', 'yes', 'confirm launch', 'do it', 'proceed'].includes(lower)) {
+           setInput('');
+           void decide(true);
+           return;
+         }
+-        if (['cancel', 'no', 'cancellanunch', 'abort', 'dont', 'stop'].includes(lower)) {
++        if (['cancel', 'no', 'cancel launch', 'abort', 'don t', 'stop'].includes(lower)) {
+           setInput('');
+           void decide(false);
+           return;
+         }
+       }
+-      const cameraCommand = /^(?:(?:hey |okay |ok )?oracle )?(?:please )?(expand camera|collapse camera|show product details|hide product details|pin this result|unpin result|read the label|what size is this|show scan evidence)$/.exec(normPrompt)?.[1];
++      const cameraCommand = /^(?:(?:hey |okay |ok )?oracle )?(?:please )?(expand camera|collapse camera|show product details|hide product details|pin this result|unpin result|read the label|what size is this|show scan evidence)$/.exec(systemCommand)?.[1];
+       if (cameraCommand) {
+         const actions: Record<string, string> = {
+           'expand camera': 'expand', 'collapse camera': 'collapse',
+@@ -452,33 +452,12 @@
+         return;
+       }
+       if (voiceIntent.requiresClarification) {
+-        setVadStatus('I heard an ambiguous command. Please say the specific destination, such as “open map”.');
++        const message = 'Which destination did you mean? Try saying “open map”.';
++        setVadStatus(message);
++        if (transcript && isVoiceEnabled) speakText(message);
+         recordCommandAttempt(transcript, textToSend, 'Ambiguous command', 'Asked for a destination');
+         setInput(textToSend);
+         setMode('ready');
+-        return;
+-      }
+-      const allProtocols = getStoredProtocols();
+-
+-      // Check dynamic protocols (built-in + customized + user created) with strict command matching
+-      const matchedProto = allProtocols.find(p =>
+-        p.voicePhrases.some(phrase => {
+-          const clean = phrase.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+-          if (!clean) return false;
+-          if (normPrompt === clean || normPrompt === `please ${clean}` || normPrompt === `oracle ${clean}`) return true;
+-          if (clean.includes(' ')) return false;
+-          // For single keyword phrases (e.g. "focus", "admin"), only match deliberate action commands
+-          const commandPatterns = [
+-            `activate ${clean}`, `activate protocol ${clean}`, `protocol ${clean}`, `${clean} protocol`,
+-            `start ${clean}`, `start protocol ${clean}`, `run ${clean}`, `run protocol ${clean}`,
+-            `open ${clean}`, `open protocol ${clean}`, `launch ${clean}`, `trigger ${clean}`
+-          ];
+-          return commandPatterns.some(cmd => normPrompt === cmd || normPrompt === `please ${cmd}` || normPrompt === `oracle ${cmd}`);
+-        })
+-      );
+-      if (matchedProto) {
+-        setInput('');
+-        executeProtocol(matchedProto.id, hasAdminGrant());
+         return;
+       }
+       const focus = !attachedImage && briefingFocus(textToSend);
+@@ -492,15 +471,49 @@
+         window.dispatchEvent(new CustomEvent('oracle_atlas_command', { detail: textToSend }));
+         return;
+       }
+-      if (/^(?:please\s+)?(?:open|show|launch|view)?\s*(?:the\s+)?(?:workspace|records)$/i.test(normPrompt)) {
++      if (/^(?:please\s+)?(?:open|show|launch|view)?\s*(?:the\s+)?(?:workspace|records)$/i.test(systemCommand)) {
+         setInput('');
+         onOpenRecords?.();
+         return;
+       }
+-      if (/^(?:please\s+)?(?:run|start|open|launch|execute|perform|begin)?\s*(?:a\s+)?(?:system\s+)?(?:self\s*diagnostic|diagnostics)$/i.test(normPrompt)) {
++      if (/^(?:please\s+)?(?:run|start|open|launch|execute|perform|begin)?\s*(?:a\s+)?(?:system\s+)?(?:self\s*diagnostic|diagnostics)$/i.test(systemCommand)) {
+         setInput('');
+         window.dispatchEvent(new CustomEvent('oracle_open_self_diagnostic'));
+         return;
++      }
++
++      if (!attachedImage && !isPetLaunchCommand(textToSend)) {
++        const allProtocols = getStoredProtocols();
++
++        // Check dynamic protocols (built-in + customized + user created) with strict command matching
++        const matches = allProtocols.filter(p =>
++          Array.isArray(p?.voicePhrases) && p.voicePhrases.some(phrase => {
++            const clean = typeof phrase === 'string' ? normalizeVoiceCommand(phrase) : '';
++            if (!clean) return false;
++            if (systemCommand === clean) return true;
++            if (clean.includes(' ')) return false;
++            // For single keyword phrases (e.g. "focus", "admin"), only match deliberate action commands
++            const commandPatterns = [
++              `activate ${clean}`, `activate protocol ${clean}`, `protocol ${clean}`, `${clean} protocol`,
++              `start ${clean}`, `start protocol ${clean}`, `run ${clean}`, `run protocol ${clean}`,
++              `open ${clean}`, `open protocol ${clean}`, `launch ${clean}`, `trigger ${clean}`
++            ];
++            return commandPatterns.some(cmd => systemCommand === cmd);
++          })
++        );
++        if (matches.length > 1) {
++          const message = 'More than one protocol uses that phrase. Use a unique phrase.';
++          setInput(textToSend);
++          setVadStatus(message);
++          recordCommandAttempt(transcript, textToSend, 'Conflicting protocol phrases', 'Asked for a unique phrase');
++          if (transcript && isVoiceEnabled) speakText(message);
++          return;
++        }
++        if (matches.length === 1) {
++          setInput('');
++          executeProtocol(matches[0].id, hasAdminGrant());
++          return;
++        }
+       }
+ 
+       if ((!textToSend && !attachedImage) || isGeneratingRef.current || decision.current || actionRef.current) return;
+@@ -569,7 +582,7 @@
+       const petRequest = !currentImage && (taught?.action === 'launch_pet' || isPetLaunchCommand(textToSend));
+       const historyId = petRequest
+         ? recordCommandAttempt(transcript, textToSend, taughtActionLabels.launch_pet, 'Requested launch confirmation')
+-        : !currentImage && /^(?:open|close|launch|start|show|hide|turn on|turn off)\b/.test(normPrompt)
++        : !currentImage && /^(?:open|close|launch|start|show|hide|turn on|turn off)\b/.test(systemCommand)
+           ? recordCommandAttempt(transcript, textToSend, 'No local command match', 'Sent to chat gateway')
+           : undefined;
+       draftImageUrl.current = null;
+@@ -1011,9 +1024,17 @@
+           setUserCaption(caption);
+           setTimeout(() => setUserCaption(current => current === caption ? null : current), 6000);
+           if (!isOpen) onWake?.();
+-          draftTranscript.current = transcribedText.trim();
+-          setInput(draftTranscript.current);
+-          setMode('ready');
++          const text = transcribedText.trim();
++          const intent = interpretVoiceIntent(text);
++          if (!attachedImage && !isGeneratingRef.current && !actionRef.current && !decision.current &&
++              (intent.name !== 'unknown' || intent.requiresClarification)) {
++            draftTranscript.current = undefined;
++            await voiceHandlers.current.handleSend(text, text);
++          } else {
++            draftTranscript.current = text;
++            setInput(text);
++            setMode('ready');
++          }
+         }
+       } else {
+         setUserCaption(null);
+--- a/frontend/src/utils/taughtCommands.ts
++++ b/frontend/src/utils/taughtCommands.ts
+@@ -1,4 +1,4 @@
+-import { interpretVoiceIntent } from './voiceIntent';
++import { interpretVoiceIntent, normalizeVoiceCommand } from './voiceIntent';
+ 
+ const storageKey = 'oracle_taught_commands';
+ const legacyKey = 'oracle_taught_atlas_phrases';
+@@ -29,10 +29,7 @@
+ }
+ 
+ export function isPetLaunchCommand(text: string): boolean {
+-  const command = phraseKey(text)
+-    .replace(/^(?:(?:hey|hi|ok|okay) )?oracle /, '')
+-    .replace(/^(?:please|can you|could you) /, '');
+-  return actionFor(command) === 'launch_pet';
++  return actionFor(normalizeVoiceCommand(text)) === 'launch_pet';
+ }
+ 
+ export function parseTeachingRequest(text: string): TaughtCommand | null | undefined {
+@@ -62,9 +59,9 @@
+ }
+ 
+ export function findTaughtCommand(text: string, storage: Storage = localStorage): TaughtCommand | undefined {
+-  const key = phraseKey(text).replace(/^(?:(?:hey|hi|ok|okay) )?oracle /, '');
++  const key = normalizeVoiceCommand(text);
+   try {
+-    return key ? loadTaughtCommands(storage).find(item => phraseKey(item.phrase) === key) : undefined;
++    return key ? loadTaughtCommands(storage).find(item => normalizeVoiceCommand(item.phrase) === key) : undefined;
+   } catch {
+     return undefined;
+   }
+@@ -76,13 +73,13 @@
+   const remaining = commands.filter(item => item.phrase !== previous);
+   if (replacement !== null) {
+     const phrase = replacement.phrase.trim();
+-    const key = phraseKey(phrase);
++    const key = normalizeVoiceCommand(phrase);
+     const intent = interpretVoiceIntent(phrase);
+     if (phrase.length > 100 || key.length < 3) throw new Error('Use a phrase between 3 and 100 characters.');
+     if (actionFor(phrase) || intent.name !== 'unknown' || intent.requiresClarification || /^(?:when i say|oracle|confirm|cancel|yes|no|stop)\b/.test(key)) {
+       throw new Error('Choose a phrase that is distinct from an existing command.');
+     }
+-    if (remaining.some(item => phraseKey(item.phrase) === key)) throw new Error('That phrase is already saved.');
++    if (remaining.some(item => normalizeVoiceCommand(item.phrase) === key)) throw new Error('That phrase is already saved.');
+     remaining.push({ ...replacement, phrase });
+   }
+   storage.setItem(storageKey, JSON.stringify(remaining));
+--- a/frontend/src/utils/voiceIntent.ts
++++ b/frontend/src/utils/voiceIntent.ts
+@@ -20,19 +20,26 @@
+     .replace(/\s+/g, ' ')
+     .trim();
+ 
+-const stripPolitePrefix = (text: string): string =>
+-  text
+-    .replace(/^(?:(?:hey|hi|ok|okay)\s+)?oracle(?:\s+|$)/i, '')
+-    .replace(/^(?:(?:please|can you|could you|would you)\s+)+/i, '')
+-    .replace(/\s+please$/i, '')
+-    .trim();
++// Remove only explicit address/politeness wrappers; never guess the destination.
++export function normalizeVoiceCommand(text: string): string {
++  let command = normalize(text);
++  let previous: string;
++  do {
++    previous = command;
++    command = command
++      .replace(/^(?:(?:hey|hi|ok|okay)\s+)?oracle(?:\s+|$)/, '')
++      .replace(/^(?:please|can you|could you|would you)\s+/, '')
++      .replace(/\s+please$/, '').trim();
++  } while (command !== previous);
++  return command;
++}
+ 
+ const commands = [
+   ['open_map', /^(?:(?:open|show|display|launch|view|activate|enter|bring up) )?(?:the )?(?:tactical )?(?:geo )?(?:map|maps|atlas|spatial intelligence)(?: (?:view|mode))?$/],
+   ['close_map', /^(?:close|hide|exit|minimize) (?:the )?(?:tactical )?(?:geo )?(?:map|maps|atlas)$/],
+-  ['open_settings', /^(?:open|show|display|launch|view) (?:the )?(?:system )?settings$/],
+-  ['open_camera', /^(?:open|show|start|turn on) (?:the )?camera$/],
+-  ['close_camera', /^(?:close|stop|turn off) (?:the )?camera$/],
++  ['open_settings', /^(?:open|show|display|launch|view|bring up) (?:the )?(?:system )?settings$/],
++  ['open_camera', /^(?:open|show|start|turn on|enable) (?:the )?camera$/],
++  ['close_camera', /^(?:close|stop|turn off|disable) (?:the )?camera$/],
+ ] as const;
+ 
+ export const commandEvents = {
+@@ -45,7 +52,7 @@
+ 
+ export function interpretVoiceIntent(text: string): VoiceIntent {
+   const normalizedText = normalize(text);
+-  const command = stripPolitePrefix(normalizedText);
++  const command = normalizeVoiceCommand(normalizedText);
+ 
+   const match = commands.find(([, pattern]) => pattern.test(command));
+   if (match) {
+--- a/backend/app/live_answers.py
++++ b/backend/app/live_answers.py
+@@ -351,6 +351,10 @@
+ 
+ def correct_question(text):
+     query = normalize_question(text)
++    # Action commands must retain their wording, even when they resemble a question typo.
++    action_query = re.sub(r'^(?:(?:can|could|would) you |please )+', '', query, flags=re.I)
++    if re.match(r'^(?:open|close|launch|start|stop|activate|deactivate|enable|disable|hide|exit|minimize|run|show|display|view|enter|bring up|turn on|turn off)\b', action_query, re.I):
++        return text
+     if len(query) > 160:
+         return text
+     tokens = query.split()
+--- a/frontend/src/components/AdminProtocolOverlay.tsx
++++ b/frontend/src/components/AdminProtocolOverlay.tsx
+@@ -52,7 +52,7 @@
+   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+   const recordedChunksRef = useRef<Blob[]>([]);
+-  const recordingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
++  const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const attemptRef = useRef<{ id?: string; controller: AbortController; completed: boolean } | null>(null);
+   const onCloseRef = useRef(onClose);
+   onCloseRef.current = onClose;
+--- a/frontend/src/components/PersonProfileControls.tsx
++++ b/frontend/src/components/PersonProfileControls.tsx
+@@ -62,7 +62,7 @@
+   const voiceMediaRecorderRef = useRef<MediaRecorder | null>(null);
+   const voiceStreamRef = useRef<MediaStream | null>(null);
+   const voiceChunksRef = useRef<Blob[]>([]);
+-  const voiceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
++  const voiceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const challengePhrase = 'Authorize Oracle System';
+ 
+   useEffect(() => {

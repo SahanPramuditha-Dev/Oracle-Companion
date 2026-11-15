@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Central Celestial Sphere (Platinum Silver #CBD5E1 with Dark Core Fill) -->
+    <path
+        android:strokeColor="#CBD5E1"
+        android:strokeWidth="4.2"
+        android:strokeAlpha="0.9"
+        android:fillColor="#0A101D"
+        android:pathData="M54,54m-22,0a22,22 0 1,1 44,0a22,22 0 1,1 -44,0" />
+
+    <!-- Rotated Orbital Ring (-34 deg) & Luminous Beacon Node -->
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="-34">
+        <!-- Orbital Ring Ellipse (#38BDF8) -->
+        <path
+            android:strokeColor="#38BDF8"
+            android:strokeWidth="5.2"
+            android:pathData="M22.3,54a31.7,10.6 0 1,0 63.4,0a31.7,10.6 0 1,0 -63.4,0" />
+        <!-- Satellite Beacon Halo (#00F3FF) -->
+        <path
+            android:fillColor="#00F3FF"
+            android:fillAlpha="0.3"
+            android:pathData="M81,54m-8.5,0a8.5,8.5 0 1,1 17,0a8.5,8.5 0 1,1 -17,0" />
+        <!-- Satellite Beacon Core (#00F3FF body, #FFFFFF specular center) -->
+        <path
+            android:fillColor="#00F3FF"
+            android:pathData="M81,54m-5.2,0a5.2,5.2 0 1,1 10.4,0a5.2,5.2 0 1,1 -10.4,0" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M81,54m-2.6,0a2.6,2.6 0 1,1 5.2,0a2.6,2.6 0 1,1 -5.2,0" />
+    </group>
+</vector>

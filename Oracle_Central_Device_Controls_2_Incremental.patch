@@ -1,0 +1,96 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -431,17 +431,34 @@
+             if command is not None:
+                 raise Problem(501, "PC controls require Windows.")
+             return {"supported": False}
++        from .companion_windows import battery_status, master_volume
+         with self.controls_lock:
+             pending = self.scheduled_shutdown
+             if command is None:
++                try:
++                    volume = master_volume()
++                except OSError:
++                    volume = None
+                 return {"supported": True, "scheduled": {"due": pending["due"]} if pending else None,
+-                        "canCancel": bool(pending and pending["owner"] == device)}
++                        "canCancel": bool(pending and pending["owner"] == device),
++                        "battery": battery_status(), "volume": volume}
+             action = command.get("action")
+             if not isinstance(action, str) or action not in {
+                 "lock", "previous", "play_pause", "next", "volume_down", "volume_up", "mute",
+-                "shutdown", "restart", "schedule", "cancel"
++                "shutdown", "restart", "schedule", "cancel", "set_volume"
+             }:
+                 raise Problem(400, "Unknown device control.")
++            if action == "set_volume":
++                percent = command.get("percent")
++                if type(percent) is not int or not 0 <= percent <= 100:
++                    raise Problem(400, "Choose a volume from 0 to 100 percent.")
++                try:
++                    applied = master_volume(percent)
++                except OSError:
++                    raise Problem(503, "Windows audio endpoint is unavailable.") from None
++                message = f"Windows volume is {applied['percent']}%."
++                self._record_control(device, "requested", message)
++                return {"message": message, "volume": applied}
+             if action == "cancel":
+                 if not pending or pending["owner"] != device:
+                     raise Problem(409, "No shutdown from this phone is pending.")
+--- /dev/null
++++ b/backend/app/companion_windows.py
+@@ -0,0 +1,54 @@
++import ctypes as c
++import uuid
++from ctypes import wintypes as w
++
++class PowerStatus(c.Structure):
++    _fields_ = [("ac", c.c_ubyte), ("flags", c.c_ubyte), ("percent", c.c_ubyte),
++                ("saver", c.c_ubyte), ("remaining", w.DWORD), ("full", w.DWORD)]
++
++def battery_status():
++    status = PowerStatus()
++    if not c.windll.kernel32.GetSystemPowerStatus(c.byref(status)):
++        return None
++    if status.flags == 255 or status.flags & 128 or status.percent > 100:
++        return None
++    return {"percent": status.percent, "pluggedIn": status.ac == 1,
++            "charging": bool(status.flags & 8)}
++
++def guid(value):
++    return (c.c_ubyte * 16).from_buffer_copy(uuid.UUID(value).bytes_le)
++
++def invoke(pointer, index, *args, returns=c.c_long):
++    table = c.cast(pointer, c.POINTER(c.POINTER(c.c_void_p))).contents
++    parameters = [type(arg) for arg in args]
++    fn = c.WINFUNCTYPE(returns, c.c_void_p, *parameters)(table[index])
++    return fn(pointer, *args)
++
++def check(result):
++    if result < 0:
++        raise OSError(f"Core Audio failed ({result & 0xffffffff:#010x})")
++
++def master_volume(level=None):
++    ole = c.windll.ole32
++    result = ole.CoInitializeEx(None, 0)
++    check(result)
++    enumerator, device, endpoint = (c.c_void_p() for _ in range(3))
++    try:
++        clsid = guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
++        iid = guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
++        check(ole.CoCreateInstance(c.byref(clsid), None, 1, c.byref(iid), c.byref(enumerator)))
++        check(invoke(enumerator, 4, c.c_int(0), c.c_int(1), c.pointer(device)))
++        iid = guid("5CDF2C82-841E-4546-9722-0CF74078229A")
++        check(invoke(device, 3, c.pointer(iid), w.DWORD(1), c.c_void_p(), c.pointer(endpoint)))
++        if level is not None:
++            check(invoke(endpoint, 7, c.c_float(level / 100), c.c_void_p()))
++        scalar = c.c_float()
++        muted = w.BOOL()
++        check(invoke(endpoint, 9, c.pointer(scalar)))
++        check(invoke(endpoint, 15, c.pointer(muted)))
++        return {"percent": round(scalar.value * 100), "muted": bool(muted.value)}
++    finally:
++        for pointer in (endpoint, device, enumerator):
++            if pointer:
++                invoke(pointer, 2, returns=w.ULONG)
++        ole.CoUninitialize()

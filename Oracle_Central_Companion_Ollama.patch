@@ -1,0 +1,50 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -16,6 +16,9 @@
+ import uuid
+ from contextlib import contextmanager
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from urllib.parse import urlsplit
++
++from dotenv import dotenv_values
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ PREFIX = "/companion/v1"
+@@ -133,6 +136,19 @@
+             raise Problem(503, "Oracle local API credential is empty.")
+         return token, local_json(8000, "/api/v1/capabilities", token=token)
+ 
++    def ollama_port(self):
++        values = dotenv_values(self.oracle / "backend/.env")
++        configured = os.environ.get("OLLAMA_BASE_URL", values.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434")
++        try:
++            url = urlsplit(configured)
++            if (url.scheme == "http" and url.hostname in {"127.0.0.1", "localhost"}
++                    and not (url.username or url.password or url.query or url.fragment)
++                    and not url.path.strip("/")):
++                return url.port if url.port is not None else 80
++        except ValueError:
++            pass
++        raise Problem(503, "Companion chat requires a local Ollama HTTP address.")
++
+     def status(self):
+         try:
+             _, capabilities = self.capabilities()
+@@ -140,7 +156,7 @@
+             return {"pc": self.name, "oracle": False, "model": False, "action": False}
+         model = capabilities.get("model", {})
+         try:
+-            tags = local_json(11434, "/api/tags", timeout=2)
++            tags = local_json(self.ollama_port(), "/api/tags", timeout=2)
+             name = model.get("name")
+             ready = model.get("processing") == "local" and bool(name) and any(
+                 item.get("name") in (name, f"{name}:latest") for item in tags.get("models", [])
+@@ -183,7 +199,7 @@
+                 context = [{"role": "assistant" if row["role"] == "model" else "user",
+                             "content": row["text"][:4000]} for row in reversed(rows)]
+                 context.append({"role": "user", "content": text})
+-                result = local_json(11434, "/api/chat", {"model": model["name"], "stream": False,
++                result = local_json(self.ollama_port(), "/api/chat", {"model": model["name"], "stream": False,
+                                     "messages": context, "options": {"num_predict": 512}}, timeout=80)
+                 reply = result.get("message", {}).get("content", "").strip()
+                 if not reply:

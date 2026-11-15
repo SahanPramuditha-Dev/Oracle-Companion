@@ -1,0 +1,238 @@
+--- a/backend/app/companion_settings.py
++++ b/backend/app/companion_settings.py
+@@ -1,4 +1,4 @@
+-"""Authenticated Oracle Central controls for the Android LAN gateway."""
++"""Authenticated Oracle Central controls for the Android Companion gateway."""
+ import base64
+ import hashlib
+ import ipaddress
+@@ -17,6 +17,7 @@
+ 
+ 
+ LAN_NETWORKS = tuple(ipaddress.ip_network(net) for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
++TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+ WINDOWS_ADAPTERS = """
+ [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+ $ErrorActionPreference = 'Stop'
+@@ -59,44 +60,61 @@
+ 
+ class PairingRequest(BaseModel):
+     address: ipaddress.IPv4Address | None = None
++    remote_address: ipaddress.IPv4Address | None = None
+ 
+ 
+ class CompanionSettings:
+     def __init__(self):
+         self.lock = threading.Lock()
+         self.server = None
++        self.remote_server = None
+         self.gateway = None
+         self.root = Path(__file__).resolve().parents[2]
+         self.state = Path(os.environ.get("LOCALAPPDATA", str(self.root / "data"))) / "OracleCompanion"
+ 
+     def restore(self):
+         try:
+-            address = ipaddress.IPv4Address((self.state / "listener-address").read_text().strip())
+-            if any(address in net for net in LAN_NETWORKS):
+-                with self.lock:
+-                    self.start_listener(str(address))
++            addresses = (self.state / "listener-address").read_text().splitlines()
+         except FileNotFoundError:
+             return
+-        except (OSError, ValueError, ImportError):
+-            logging.getLogger(__name__).warning("Companion listener could not be restored.", exc_info=True)
+-
++        with self.lock:
++            for index, value in enumerate(addresses[:2]):
++                try:
++                    address = ipaddress.IPv4Address(value)
++                    networks = (TAILSCALE_NETWORK,) if index == 1 else LAN_NETWORKS
++                    if any(address in net for net in networks):
++                        self.start_listener(str(address), remote=index == 1)
++                except (OSError, ValueError, ImportError):
++                    logging.getLogger(__name__).warning("Companion listener could not be restored.", exc_info=True)
+ 
+     def close(self):
+         with self.lock:
+-            if self.server:
+-                self.server.shutdown()
+-                self.server.server_close()
+-                self.server = None
++            self.stop_listener("remote_server")
++            self.stop_listener("server")
++
++    def stop_listener(self, slot):
++        server = getattr(self, slot)
++        if server is not None:
++            server.shutdown()
++            server.server_close()
++            setattr(self, slot, None)
++
++    def remote_address(self):
++        server = self.remote_server
++        return server.server_address[0] if server else ""
+ 
+     def network(self, pairing_id: str | None = None):
+         adapters = detect_adapters()
+         preferred = next((adapter for adapter in adapters or [] if adapter["wifi"]), None)
+         with self.lock:
+             label = self.gateway.paired_label(pairing_id) if self.gateway and pairing_id else None
+-        return {"adapters": adapters, "preferred": preferred, "pairedLabel": label}
++            remote = self.remote_address()
++        return {"adapters": adapters, "preferred": preferred, "pairedLabel": label, "remoteAddress": remote}
+ 
+-    def start_listener(self, address: str):
+-        if self.server is None or self.server.server_address[0] != address:
++    def start_listener(self, address: str, *, remote=False):
++        slot = "remote_server" if remote else "server"
++        previous = getattr(self, slot)
++        if previous is None or previous.server_address[0] != address:
+             gateway = self.gateway or Gateway(self.state, self.root)
+             cert, key = certificate(self.state)
+             pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
+@@ -109,16 +127,15 @@
+                                                     do_handshake_on_connect=False)
+                 server.gateway = gateway
+                 server.pin = pin
++                server.remote_address = self.remote_address
+                 if self.gateway is None:
+                     gateway.recover()
+                 threading.Thread(target=server.serve_forever, daemon=True).start()
+             except Exception:
+                 server.server_close()
+                 raise
+-            if self.server:
+-                self.server.shutdown()
+-                self.server.server_close()
+-            self.server = server
++            self.stop_listener(slot)
++            setattr(self, slot, server)
+             self.gateway = gateway
+ 
+     def issue(self, request: PairingRequest):
+@@ -131,27 +148,36 @@
+             address = str(request.address)
+         else:
+             raise HTTPException(400, "Enter the private IPv4 address of this PC's Wi-Fi adapter.")
++        remote = request.remote_address
++        if remote is not None and remote not in TAILSCALE_NETWORK:
++            raise HTTPException(400, "Enter the PC's Tailscale IPv4 address.")
+         try:
+             import qrcode
+             from qrcode.image.svg import SvgPathImage
+             with self.lock:
+                 self.start_listener(address)
++                if "remote_address" in request.model_fields_set:
++                    if remote is None:
++                        self.stop_listener("remote_server")
++                    else:
++                        self.start_listener(str(remote), remote=True)
++                remote_host = self.remote_address()
+                 config = self.state / "listener-address"
+                 pending = config.with_suffix(".tmp")
+-                pending.write_text(address, encoding="ascii")
++                pending.write_text("\n".join(filter(None, (address, remote_host))), encoding="ascii")
+                 pending.replace(config)
+                 gateway = self.server.gateway
+                 code = gateway.issue()
+                 payload = json.dumps({"v": 1, "host": address, "port": 8443,
+                                       "pin": self.server.pin, "pc": gateway.name,
+-                                      "code": code}, separators=(",", ":"))
++                                      "code": code, "remoteHost": remote_host}, separators=(",", ":"))
+                 image = qrcode.make(payload, image_factory=SvgPathImage).to_string()
+                 return {"image": base64.b64encode(image).decode(), "expiresIn": TTL,
+                         "address": address, "pairingId": digest(code)}
+         except ImportError as error:
+             raise HTTPException(503, "Install the Companion Python requirements in the Oracle backend environment.") from error
+         except OSError as error:
+-            raise HTTPException(503, "Could not start the Companion listener. Check the Wi-Fi address and port 8443.") from error
++            raise HTTPException(503, "Could not start the Companion listener. Check the selected network addresses and port 8443.") from error
+ 
+     def router(self):
+         router = APIRouter(prefix="/api/v1/companion")
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -174,20 +174,10 @@
+         except Problem:
+             ready = False
+         return {"pc": self.name, "oracle": True, "model": ready, "action": True,
+-                "deviceHealth": self.device_health(),
+                 "modelName": model.get("name") if ready else None,
+                 "chatStreaming": True,
+                 "atlasAction": True,
+                 "replyModes": ready and name.split(":", 1)[0].rsplit("/", 1)[-1].lower() == "qwen3"}
+-
+-    def device_health(self):
+-        try:
+-            import psutil
+-            cpu = psutil.cpu_percent(interval=0.05)
+-            ram = psutil.virtual_memory().percent
+-        except (ImportError, OSError, RuntimeError):
+-            return None
+-        return {"cpuPercent": cpu, "ramPercent": ram, "sampledAt": int(time.time())}
+ 
+     def history(self):
+         with self.db() as db:
+@@ -349,7 +339,11 @@
+         device = gateway.device(header[7:])
+         if self.command == "GET":
+             if path == "/status":
+-                return gateway.status()
++                status = gateway.status()
++                remote_address = getattr(self.server, "remote_address", None)
++                if remote_address is not None:
++                    status["remoteHost"] = remote_address()
++                return status
+             if path == "/chat":
+                 return gateway.history()
+             if path == "/activity":
+--- a/frontend/src/components/CompanionSettingsPane.tsx
++++ b/frontend/src/components/CompanionSettingsPane.tsx
+@@ -5,11 +5,12 @@
+ import './CompanionSettingsPane.css';
+ 
+ type Adapter = { name: string; address: string };
+-type Network = { adapters: Adapter[] | null; preferred: Adapter | null; pairedLabel: string | null };
++type Network = { adapters: Adapter[] | null; preferred: Adapter | null; pairedLabel: string | null; remoteAddress?: string };
+ type PairingCode = { image: string; expiresIn: number; address: string; pairingId: string };
+ 
+ export function CompanionSettingsPane() {
+   const [selection, setSelection] = useState('');
++  const [remoteInput, setRemoteInput] = useState<string | null>(null);
+   const [manualAddress, setManualAddress] = useState('');
+   const [network, setNetwork] = useState<Network | null>(null);
+   const [networkError, setNetworkError] = useState(false);
+@@ -18,6 +19,7 @@
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState('');
+   const [pairedLabel, setPairedLabel] = useState<string | null>(null);
++  const remoteAddress = remoteInput ?? network?.remoteAddress ?? '';
+   const address = selection === 'manual' ? manualAddress.trim() : selection;
+   const effectiveAddress = selection ? address : network?.preferred?.address;
+   const addressChanged = pairing && (pairing.automatic
+@@ -64,7 +66,10 @@
+     setPairedLabel(null);
+     try {
+       const result = await localApi<PairingCode>(
+-        'companion/pairing', 'POST', address ? { address } : {},
++        'companion/pairing', 'POST', {
++          ...(address ? { address } : {}),
++          ...(remoteInput === null ? {} : { remote_address: remoteAddress.trim() || null }),
++        },
+       );
+       const issued = Date.now();
+       setNow(issued);
+@@ -130,6 +135,13 @@
+               </>}
+             </div>
+           </details>
++          <div className="companion-settings-field">
++            <label className="settings-tile-title" htmlFor="companion-remote">Tailscale IPv4 address (optional)</label>
++            <input className="settings-input" id="companion-remote" value={remoteAddress}
++              onChange={event => setRemoteInput(event.target.value)} placeholder="100.x.x.x"
++              disabled={busy} autoComplete="off" spellCheck={false} />
++            <p className="settings-tile-desc">Join the same Tailscale network on both devices. Generate a QR code to save this setting. Clear the address and generate a new code to disable remote access.</p>
++          </div>
+           <button className="settings-option-pill active" type="submit" disabled={busy || !effectiveAddress}>
+             <QrCode size={12} aria-hidden="true" />
+             {busy ? 'Generating…' : pairing ? 'Generate new QR code' : 'Generate QR code'}

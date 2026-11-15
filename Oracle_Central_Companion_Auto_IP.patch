@@ -1,0 +1,104 @@
+--- a/backend/app/companion_settings.py
++++ b/backend/app/companion_settings.py
+@@ -4,6 +4,7 @@
+ import ipaddress
+ import json
+ import os
++import socket
+ import ssl
+ import threading
+ from pathlib import Path
+@@ -12,6 +13,21 @@
+ from pydantic import BaseModel
+ 
+ from .companion_gateway import Gateway, Handler, ThreadingHTTPServer, TTL, certificate
++
++
++PAIRING_NETWORKS = tuple(ipaddress.ip_network(network) for network in
++                         ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
++
++
++def pairing_address():
++    try:
++        # UDP connect selects the interface for the default IPv4 route without sending data.
++        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
++            probe.connect(("1.1.1.1", 443))
++            address = ipaddress.IPv4Address(probe.getsockname()[0])
++    except OSError:
++        return {"address": None}
++    return {"address": str(address) if any(address in net for net in PAIRING_NETWORKS) else None}
+ 
+ 
+ class PairingRequest(BaseModel):
+@@ -32,8 +48,7 @@
+ 
+     def issue(self, request: PairingRequest):
+         address = str(request.address)
+-        if not any(request.address in ipaddress.ip_network(net) for net in
+-                   ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
++        if not any(request.address in ipaddress.ip_network(net) for net in PAIRING_NETWORKS):
+             raise HTTPException(400, "Enter the private IPv4 address of this PC's Wi-Fi adapter.")
+         try:
+             import qrcode
+@@ -75,5 +90,6 @@
+ 
+     def router(self):
+         router = APIRouter(prefix="/api/v1/companion")
++        router.add_api_route("/address", pairing_address, methods=["GET"])
+         router.add_api_route("/pairing", self.issue, methods=["POST"])
+         return router
+--- a/frontend/src/components/CompanionSettingsPane.tsx
++++ b/frontend/src/components/CompanionSettingsPane.tsx
+@@ -3,11 +3,37 @@
+ 
+ export function CompanionSettingsPane() {
+   const [address, setAddress] = useState('');
++  const [detecting, setDetecting] = useState(true);
++  const [detectionHint, setDetectionHint] = useState('Detecting this PC’s local address…');
+   const [pairing, setPairing] = useState<{ image: string; expiresAt: number } | null>(null);
+   const [now, setNow] = useState(Date.now);
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState('');
+   const seconds = pairing ? Math.max(0, Math.ceil((pairing.expiresAt - now) / 1000)) : 0;
++
++  useEffect(() => {
++    const controller = new AbortController();
++    async function detectAddress() {
++      try {
++        const result = await localApi<{ address: string | null }>(
++          'companion/address', 'GET', undefined, controller.signal,
++        );
++        if (controller.signal.aborted) return;
++        if (result.address) {
++          setAddress((current) => current || result.address || '');
++          setDetectionHint('Detected from this PC’s active network. Edit it if your phone uses another network.');
++        } else {
++          setDetectionHint('No local address detected. Enter your Wi-Fi IPv4 address manually.');
++        }
++      } catch {
++        if (!controller.signal.aborted) setDetectionHint('Automatic detection unavailable. Enter the address manually.');
++      } finally {
++        if (!controller.signal.aborted) setDetecting(false);
++      }
++    }
++    void detectAddress();
++    return () => controller.abort();
++  }, []);
+ 
+   useEffect(() => {
+     if (!pairing) return;
+@@ -38,10 +64,10 @@
+       <h2>Oracle Companion</h2>
+       <p>Connect your Android phone to the same Wi-Fi network as this PC.</p>
+       <form onSubmit={(event) => { event.preventDefault(); void createCode(); }}>
+-        <label htmlFor="companion-address">Windows Wi-Fi IPv4 address</label>{' '}
+-        <input id="companion-address" value={address} onChange={(event) => setAddress(event.target.value)}
+-          placeholder="192.168.1.25" required disabled={busy} autoComplete="off" />
+-        <p>Run <code>ipconfig</code> on Windows to find the Wi-Fi IPv4 address.</p>
++        <label htmlFor="companion-address">PC local IPv4 address</label>{' '}
++        <input id="companion-address" value={address} onChange={(event) => { setAddress(event.target.value); setPairing(null); }}
++          placeholder="192.168.1.25" required disabled={busy || detecting} autoComplete="off" aria-describedby="companion-address-hint" />
++        <p id="companion-address-hint" role="status">{detectionHint}</p>
+         <button type="submit" disabled={busy || !address.trim()}>
+           {busy ? 'Generating…' : pairing ? 'Generate new QR code' : 'Pair a phone'}
+         </button>

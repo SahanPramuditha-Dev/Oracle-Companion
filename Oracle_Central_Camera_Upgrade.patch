@@ -1,0 +1,40 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -433,7 +433,11 @@
+         if not header.startswith("Bearer ") or len(header) > 128:
+             raise Problem(401, "Pair this phone first.")
+         device = gateway.device(header[7:], getattr(self.server, "transport", "lan"))
+-        if self.command == "POST" and path in {"/vision", "/vision/detect"}:
++        if self.command == "POST" and path in {
++            "/vision", "/vision/detect", "/vision/people", "/vision/read", "/vision/product",
++        }:
++            if path == "/vision/people" and getattr(self.server, "transport", "lan") != "lan":
++                raise Problem(403, "People recognition is available on your local connection only.")
+             body = self.body(175_000)
+             try:
+                 photo = base64.b64decode(field(body, "image", 172_000), validate=True)
+@@ -444,6 +448,24 @@
+             if path == "/vision/detect":
+                 return local_json(8000, "/api/v1/vision/detect", photo, gateway.api_token(),
+                                   timeout=10, content_type="image/jpeg")
++            if path == "/vision/people":
++                scan = local_json(
++                    8000, "/api/v1/people/identify?public_figures=false", photo,
++                    gateway.api_token(), timeout=30, content_type="image/jpeg",
++                )
++                return {"identified": [
++                    {"box": face.get("box"), "matched": face.get("matched") is True,
++                     "name": face.get("name") if face.get("matched") is True else "Unknown",
++                     "permission": face.get("permission") if face.get("matched") is True else None}
++                    for face in scan.get("identified", [])[:40]
++                ]}
++            if path in {"/vision/read", "/vision/product"}:
++                target, timeout = {
++                    "/vision/read": ("/api/v1/images/read", 30),
++                    "/vision/product": ("/api/v1/vision/products/inspect", 95),
++                }[path]
++                return local_json(8000, target, photo, gateway.api_token(),
++                                  timeout=timeout, content_type="image/jpeg")
+             prompt = field(body, "prompt", 1000)
+             return local_json(
+                 8000, "/api/v1/vision/ask?" + urlencode({"prompt": prompt}), photo,

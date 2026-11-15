@@ -1,0 +1,566 @@
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -72,12 +72,16 @@
+                recognizer: PersonRecognizer | None = None, google: GoogleWorkspace | None = None):
+     if token is None:
+         token = TOKEN_PATH.read_text(encoding='utf-8').strip() if TOKEN_PATH.exists() else ''
++    from .companion_settings import CompanionSettings
++    companion = CompanionSettings()
++
+     @asynccontextmanager
+     async def lifespan(app):
+         try:
+             async with ollama.lifespan() if isinstance(ollama, Ollama) else nullcontext():
+                 yield
+         finally:
++            await run_in_threadpool(companion.close)
+             if records is not None:
+                 records.engine.dispose()
+ 
+@@ -760,6 +764,7 @@
+             except ProviderError as error:
+                 raise HTTPException(error.status, error.message) from None
+ 
++    app.include_router(companion.router(), dependencies=[Depends(authorized)])
+     app.include_router(google_router(google, authorized, records))
+     app.include_router(research_router(generate_document_answer), dependencies=[Depends(authorized)])
+     app.include_router(geo_router(records), dependencies=[Depends(authorized)])
+--- a/frontend/src/components/SystemSettingsModal.tsx
++++ b/frontend/src/components/SystemSettingsModal.tsx
+@@ -8,6 +8,7 @@
+ import { PersonProfileControls, type PersonProfile } from './PersonProfileControls';
+ import './SystemSettingsModal.css';
+ import { GoogleWorkspace } from './GoogleWorkspace';
++import { CompanionSettingsPane } from './CompanionSettingsPane';
+ import { CommandHistoryPane } from './CommandHistoryPane';
+ import { ReplyPreferencesPane } from './ReplyPreferencesPane';
+ import { changeTaughtCommand, loadTaughtCommands, taughtActionLabels, taughtCommandsChanged, type TaughtCommand } from '../utils/taughtCommands';
+@@ -356,7 +357,7 @@
+   onCameraControlsMount,
+   initialTab
+ }) => {
+-  const [activeTab, setActiveTab] = useState<'faces' | 'enroll' | 'camera' | 'voice' | 'vitals' | 'google' | 'display' | 'intelligence' | 'shortcuts'>(
++  const [activeTab, setActiveTab] = useState<'faces' | 'enroll' | 'camera' | 'voice' | 'vitals' | 'google' | 'display' | 'intelligence' | 'shortcuts' | 'companion'>(
+     () => initialTab || 'faces'
+   );
+ 
+@@ -1152,6 +1153,9 @@
+ 
+               <div style={{ height: 6 }} />
+               <span className="settings-nav-label">Connections</span>
++              <button type="button" className={`settings-rail-btn ${activeTab === 'companion' ? 'active' : ''}`} onClick={() => setActiveTab('companion')}>
++                <div className="rail-btn-left"><Link2 size={13} /><span>Companion</span></div>
++              </button>
+               <button type="button" className={`settings-rail-btn ${activeTab === 'google' ? 'active' : ''}`} onClick={() => setActiveTab('google')}>
+                 <div className="rail-btn-left"><Link2 size={13} /><span>Google</span></div>
+               </button>
+@@ -1165,6 +1169,7 @@
+ 
+           {/* Right Content Pane */}
+           <main className="settings-content-pane">
++            {activeTab === 'companion' && <CompanionSettingsPane />}
+             {activeTab === 'google' && <div className="settings-google-connection"><GoogleWorkspace connectionOnly /></div>}
+             {/* PANE 1: ENROLLED IDENTITIES */}
+             {activeTab === 'faces' && (
+diff --git a/backend/app/companion_gateway.py b/backend/app/companion_gateway.py
+new file mode 100644
+--- /dev/null
++++ b/backend/app/companion_gateway.py
+@@ -0,0 +1,340 @@
++"""Oracle Companion LAN gateway and Windows console client."""
++import datetime as dt
++import hashlib
++import ipaddress
++import json
++import os
++from pathlib import Path
++import secrets
++import socket
++import sqlite3
++import ssl
++import threading
++import time
++import urllib.error
++import urllib.request
++import uuid
++from contextlib import contextmanager
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++ROOT = Path(__file__).resolve().parents[1]
++PREFIX = "/companion/v1"
++TTL = 120
++LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}),
++                                        urllib.request.HTTPSHandler(context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)))
++
++
++class Problem(Exception):
++    def __init__(self, status, message):
++        self.status, self.message = status, message
++
++
++def digest(value):
++    return hashlib.sha256(value.encode()).hexdigest()
++
++
++def local_json(port, path, body=None, token=None, timeout=6):
++    headers = {"Content-Type": "application/json"}
++    if token:
++        headers["Authorization"] = f"Bearer {token}"
++    request = urllib.request.Request(
++        f"http://127.0.0.1:{port}{path}",
++        data=None if body is None else json.dumps(body).encode(),
++        headers=headers,
++    )
++    try:
++        with LOCAL_HTTP.open(request, timeout=timeout) as response:
++            return json.load(response)
++    except urllib.error.HTTPError as error:
++        try:
++            payload = json.load(error)
++            message = payload.get("detail") or payload.get("message")
++        except (ValueError, AttributeError):
++            message = None
++        raise Problem(error.code, message if isinstance(message, str) else "Oracle rejected the request.") from None
++    except (OSError, ValueError):
++        raise Problem(503, "The local Oracle service did not respond.") from None
++
++
++class Gateway:
++    def __init__(self, directory, oracle):
++        self.directory = directory
++        self.oracle = oracle
++        self.name = socket.gethostname()
++        self.generating = threading.Lock()
++        directory.mkdir(parents=True, exist_ok=True)
++        with self.db() as db:
++            db.executescript("""
++                CREATE TABLE IF NOT EXISTS codes (hash TEXT PRIMARY KEY, expires INTEGER NOT NULL);
++                CREATE TABLE IF NOT EXISTS devices (hash TEXT PRIMARY KEY, id TEXT NOT NULL, label TEXT NOT NULL);
++                CREATE TABLE IF NOT EXISTS messages (
++                    sequence INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, role TEXT NOT NULL,
++                    text TEXT NOT NULL, reply_to TEXT UNIQUE, state TEXT NOT NULL DEFAULT 'complete'
++                );
++                CREATE TABLE IF NOT EXISTS actions (
++                    id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires INTEGER NOT NULL,
++                    status TEXT NOT NULL, message TEXT NOT NULL
++                );
++            """)
++
++    @contextmanager
++    def db(self):
++        db = sqlite3.connect(self.directory / "companion.db")
++        db.row_factory = sqlite3.Row
++        try:
++            with db:
++                yield db
++        finally:
++            db.close()
++
++    def recover(self):
++        with self.db() as db:
++            db.execute("UPDATE messages SET state='failed' WHERE state='pending'")
++            db.execute("UPDATE actions SET status='unknown', message=? WHERE status='confirming'",
++                       ("Windows outcome could not be verified after restart.",))
++
++    def issue(self):
++        code = secrets.token_urlsafe(24)
++        with self.db() as db:
++            db.execute("DELETE FROM codes")
++            db.execute("INSERT INTO codes VALUES (?, ?)", (digest(code), int(time.time()) + TTL))
++        return code
++
++    def pair(self, code, label):
++        credential, device = secrets.token_urlsafe(32), str(uuid.uuid4())
++        with self.db() as db:
++            used = db.execute("DELETE FROM codes WHERE hash=? AND expires>?", (digest(code), time.time()))
++            if used.rowcount != 1:
++                raise Problem(403, "Pairing code expired or already used. Create a new one on Windows.")
++            db.execute("INSERT INTO devices VALUES (?, ?, ?)", (digest(credential), device, label[:60]))
++        return {"token": credential, "pc": self.name}
++
++    def device(self, credential):
++        with self.db() as db:
++            row = db.execute("SELECT id FROM devices WHERE hash=?", (digest(credential),)).fetchone()
++        if not row:
++            raise Problem(401, "Pair this phone again from Windows.")
++        return row["id"]
++
++    def capabilities(self):
++        try:
++            token = (self.oracle / "data/dev/api-token").read_text(encoding="utf-8").strip()
++        except OSError:
++            raise Problem(503, "Start Oracle and prepare its local API credential.") from None
++        if not token:
++            raise Problem(503, "Oracle local API credential is empty.")
++        return token, local_json(8000, "/api/v1/capabilities", token=token)
++
++    def status(self):
++        try:
++            _, capabilities = self.capabilities()
++        except Problem:
++            return {"pc": self.name, "oracle": False, "model": False, "action": False}
++        model = capabilities.get("model", {})
++        try:
++            tags = local_json(11434, "/api/tags", timeout=2)
++            name = model.get("name")
++            ready = model.get("processing") == "local" and bool(name) and any(
++                item.get("name") in (name, f"{name}:latest") for item in tags.get("models", [])
++            )
++        except Problem:
++            ready = False
++        return {"pc": self.name, "oracle": True, "model": ready, "action": True,
++                "modelName": model.get("name") if ready else None}
++
++    def history(self):
++        with self.db() as db:
++            rows = db.execute(
++                "SELECT id,role,text,state FROM messages ORDER BY sequence DESC LIMIT 100"
++            ).fetchall()
++        return {"messages": [dict(row) for row in reversed(rows)]}
++
++    def send(self, identity, text):
++        if not self.generating.acquire(blocking=False):
++            raise Problem(409, "Oracle is answering another message. Try again shortly.")
++        try:
++            with self.db() as db:
++                db.execute("BEGIN IMMEDIATE")
++                existing = db.execute("SELECT role,text,state FROM messages WHERE id=?", (identity,)).fetchone()
++                if existing and (existing["role"] != "user" or existing["text"] != text):
++                    raise Problem(409, "This message ID already belongs to another message.")
++                if existing and existing["state"] == "complete":
++                    return self.history()
++                if db.execute("SELECT 1 FROM messages WHERE state='pending'").fetchone():
++                    raise Problem(409, "Oracle is answering another message. Try again shortly.")
++                rows = db.execute(
++                    "SELECT role,text FROM messages WHERE state='complete' ORDER BY sequence DESC LIMIT 8"
++                ).fetchall()
++                db.execute("INSERT INTO messages(id,role,text,state) VALUES (?,'user',?,'pending') "
++                           "ON CONFLICT(id) DO UPDATE SET state='pending'", (identity, text))
++            try:
++                _, capabilities = self.capabilities()
++                model = capabilities.get("model", {})
++                if model.get("processing") != "local" or not model.get("name"):
++                    raise Problem(503, "Configure a local Ollama model in Oracle to use companion chat.")
++                context = [{"role": "assistant" if row["role"] == "model" else "user",
++                            "content": row["text"][:4000]} for row in reversed(rows)]
++                context.append({"role": "user", "content": text})
++                result = local_json(11434, "/api/chat", {"model": model["name"], "stream": False,
++                                    "messages": context, "options": {"num_predict": 512}}, timeout=80)
++                reply = result.get("message", {}).get("content", "").strip()
++                if not reply:
++                    raise Problem(502, "The local model returned an empty answer.")
++                with self.db() as db:
++                    db.execute("INSERT INTO messages(id,role,text,reply_to) VALUES (?,'model',?,?)",
++                               (str(uuid.uuid4()), reply[:12000], identity))
++                    db.execute("UPDATE messages SET state='complete' WHERE id=?", (identity,))
++            except Exception:
++                with self.db() as db:
++                    db.execute("UPDATE messages SET state='failed' WHERE id=?", (identity,))
++                raise
++            return self.history()
++        finally:
++            self.generating.release()
++
++    def propose(self, device):
++        token, _ = self.capabilities()
++        action = local_json(8000, "/api/v1/actions/propose", {"app_id": "vscode"}, token)
++        with self.db() as db:
++            db.execute("INSERT INTO actions VALUES (?,?,?,'pending',?)",
++                       (action["id"], device, int(time.time()) + action["expires_in_seconds"],
++                        "Confirm Open VS Code."))
++        return {"id": action["id"], "pc": self.name}
++
++    def confirm(self, device, identity):
++        token, _ = self.capabilities()
++        with self.db() as db:
++            updated = db.execute("UPDATE actions SET status='confirming', message=? "
++                                 "WHERE id=? AND owner=? AND status='pending' AND expires>?",
++                                 ("Waiting for Windows.", identity, device, time.time()))
++            if updated.rowcount != 1:
++                raise Problem(409, "This action expired or was already submitted. Check Activity.")
++        try:
++            result = local_json(8000, f"/api/v1/actions/{identity}/confirm", {}, token)
++            status = result.get("status")
++            if status == "launch_requested":
++                message = "Windows accepted the VS Code launch request. Window visibility is unverified."
++            else:
++                status, message = "unknown", "Windows returned an unrecognized launch result."
++        except Problem as error:
++            status = "unknown" if error.status >= 500 else "failed"
++            message = error.message
++        with self.db() as db:
++            db.execute("UPDATE actions SET status=?, message=? WHERE id=?", (status, message, identity))
++        return {"status": status, "message": message}
++
++    def activity(self, device):
++        with self.db() as db:
++            rows = db.execute("SELECT status,message FROM actions WHERE owner=? AND status!='pending' "
++                              "ORDER BY rowid DESC LIMIT 25", (device,)).fetchall()
++        return {"events": [dict(row) for row in rows]}
++
++
++class Handler(BaseHTTPRequestHandler):
++    def setup(self):
++        self.request.settimeout(8)
++        super().setup()
++
++    def log_message(self, *args):
++        pass
++
++    def do_GET(self):
++        self.handle_api()
++
++    def do_POST(self):
++        self.handle_api()
++
++    def body(self):
++        try:
++            length = int(self.headers.get("Content-Length", "0"))
++            if not 0 <= length <= 24_000:
++                raise Problem(413, "Request is too large.")
++            result = json.loads(self.rfile.read(length) or b"{}")
++            if not isinstance(result, dict):
++                raise ValueError()
++            return result
++        except ValueError:
++            raise Problem(400, "Expected a JSON object.") from None
++
++    def route(self):
++        gateway = self.server.gateway
++        if not self.path.startswith(PREFIX + "/"):
++            raise Problem(404, "Unknown operation.")
++        path = self.path[len(PREFIX):]
++        body = self.body() if self.command == "POST" else {}
++        if self.command == "POST" and path == "/pair":
++            return gateway.pair(field(body, "code", 64), field(body, "label", 60))
++        header = self.headers.get("Authorization", "")
++        if not header.startswith("Bearer ") or len(header) > 128:
++            raise Problem(401, "Pair this phone first.")
++        device = gateway.device(header[7:])
++        if self.command == "GET":
++            if path == "/status":
++                return gateway.status()
++            if path == "/chat":
++                return gateway.history()
++            if path == "/activity":
++                return gateway.activity(device)
++        else:
++            if path == "/chat":
++                try:
++                    identity = str(uuid.UUID(field(body, "id", 36)))
++                except ValueError:
++                    raise Problem(400, "Invalid message ID.") from None
++                return gateway.send(identity, field(body, "text", 4000))
++            if path == "/actions/propose":
++                return gateway.propose(device)
++            if path == "/actions/confirm":
++                return gateway.confirm(device, field(body, "id", 64))
++            if path == "/unpair":
++                with gateway.db() as db:
++                    db.execute("DELETE FROM devices WHERE id=?", (device,))
++                return {}
++        raise Problem(404, "Unknown operation.")
++
++    def handle_api(self):
++        try:
++            status, data = 200, self.route()
++        except Problem as error:
++            status, data = error.status, {"message": error.message}
++        except Exception as error:
++            print(f"Companion request failed: {type(error).__name__}", flush=True)
++            status, data = 500, {"message": "Companion could not complete the request."}
++        payload = json.dumps(data).encode()
++        try:
++            self.send_response(status)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Cache-Control", "no-store")
++            self.send_header("Content-Length", str(len(payload)))
++            self.end_headers()
++            self.wfile.write(payload)
++        except OSError:
++            pass
++
++
++def field(body, key, limit):
++    value = body.get(key)
++    if not isinstance(value, str) or not value.strip() or len(value) > limit:
++        raise Problem(400, f"Invalid {key}.")
++    return value.strip()
++
++
++def certificate(directory):
++    from cryptography import x509
++    from cryptography.hazmat.primitives import hashes, serialization
++    from cryptography.hazmat.primitives.asymmetric import ec
++    from cryptography.x509.oid import NameOID
++
++    cert, key = directory / "companion.pem", directory / "companion-key.pem"
++    if not cert.exists() or not key.exists():
++        private = ec.generate_private_key(ec.SECP256R1())
++        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Oracle Companion")])
++        now = dt.datetime.now(dt.timezone.utc)
++        signed = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
++                  .public_key(private.public_key()).serial_number(x509.random_serial_number())
++                  .not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=365))
++                  .sign(private, hashes.SHA256()))
++        key.write_bytes(private.private_bytes(serialization.Encoding.PEM,
++                        serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
++        cert.write_bytes(signed.public_bytes(serialization.Encoding.PEM))
++    return cert, key
+diff --git a/backend/app/companion_settings.py b/backend/app/companion_settings.py
+new file mode 100644
+--- /dev/null
++++ b/backend/app/companion_settings.py
+@@ -0,0 +1,79 @@
++"""Authenticated Oracle Central controls for the Android LAN gateway."""
++import base64
++import hashlib
++import ipaddress
++import json
++import os
++import ssl
++import threading
++from pathlib import Path
++
++from fastapi import APIRouter, HTTPException
++from pydantic import BaseModel
++
++from .companion_gateway import Gateway, Handler, ThreadingHTTPServer, TTL, certificate
++
++
++class PairingRequest(BaseModel):
++    address: ipaddress.IPv4Address
++
++
++class CompanionSettings:
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.server = None
++
++    def close(self):
++        with self.lock:
++            if self.server:
++                self.server.shutdown()
++                self.server.server_close()
++                self.server = None
++
++    def issue(self, request: PairingRequest):
++        address = str(request.address)
++        if not any(request.address in ipaddress.ip_network(net) for net in
++                   ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
++            raise HTTPException(400, "Enter the private IPv4 address of this PC's Wi-Fi adapter.")
++        try:
++            import qrcode
++            from qrcode.image.svg import SvgPathImage
++            with self.lock:
++                if self.server is None:
++                    root = Path(__file__).resolve().parents[2]
++                    state = Path(os.environ.get("LOCALAPPDATA", str(root / "data"))) / "OracleCompanion"
++                    gateway = Gateway(state, root)
++                    cert, key = certificate(state)
++                    pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
++                    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++                    context.minimum_version = ssl.TLSVersion.TLSv1_2
++                    context.load_cert_chain(cert, key)
++                    server = ThreadingHTTPServer((address, 8443), Handler)
++                    try:
++                        server.socket = context.wrap_socket(server.socket, server_side=True,
++                                                            do_handshake_on_connect=False)
++                        server.gateway = gateway
++                        server.pin = pin
++                        gateway.recover()
++                        threading.Thread(target=server.serve_forever, daemon=True).start()
++                    except Exception:
++                        server.server_close()
++                        raise
++                    self.server = server
++                if self.server.server_address[0] != address:
++                    raise HTTPException(409, "Restart Oracle Central before changing the pairing address.")
++                gateway = self.server.gateway
++                payload = json.dumps({"v": 1, "host": address, "port": 8443,
++                                      "pin": self.server.pin, "pc": gateway.name,
++                                      "code": gateway.issue()}, separators=(",", ":"))
++                image = qrcode.make(payload, image_factory=SvgPathImage).to_string()
++                return {"image": base64.b64encode(image).decode(), "expiresIn": TTL}
++        except ImportError as error:
++            raise HTTPException(503, "Install the Companion Python requirements in the Oracle backend environment.") from error
++        except OSError as error:
++            raise HTTPException(503, "Could not start the Companion listener. Check the Wi-Fi address and port 8443.") from error
++
++    def router(self):
++        router = APIRouter(prefix="/api/v1/companion")
++        router.add_api_route("/pairing", self.issue, methods=["POST"])
++        return router
+diff --git a/backend/companion-requirements.txt b/backend/companion-requirements.txt
+new file mode 100644
+--- /dev/null
++++ b/backend/companion-requirements.txt
+@@ -0,0 +1,2 @@
++cryptography
++qrcode
+diff --git a/frontend/src/components/CompanionSettingsPane.tsx b/frontend/src/components/CompanionSettingsPane.tsx
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/components/CompanionSettingsPane.tsx
+@@ -0,0 +1,61 @@
++import { useEffect, useState } from 'react';
++import { localApi } from '../utils/api';
++
++export function CompanionSettingsPane() {
++  const [address, setAddress] = useState('');
++  const [pairing, setPairing] = useState<{ image: string; expiresAt: number } | null>(null);
++  const [now, setNow] = useState(Date.now);
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState('');
++  const seconds = pairing ? Math.max(0, Math.ceil((pairing.expiresAt - now) / 1000)) : 0;
++
++  useEffect(() => {
++    if (!pairing) return;
++    const timer = window.setInterval(() => setNow(Date.now()), 500);
++    return () => window.clearInterval(timer);
++  }, [pairing]);
++
++  async function createCode() {
++    setBusy(true);
++    setError('');
++    setPairing(null);
++    try {
++      const result = await localApi<{ image: string; expiresIn: number }>(
++        'companion/pairing', 'POST', { address: address.trim() },
++      );
++      const issued = Date.now();
++      setNow(issued);
++      setPairing({ image: result.image, expiresAt: issued + result.expiresIn * 1000 });
++    } catch (failure) {
++      setError(failure instanceof Error ? failure.message : 'Could not generate a pairing code.');
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <section>
++      <h2>Oracle Companion</h2>
++      <p>Connect your Android phone to the same Wi-Fi network as this PC.</p>
++      <form onSubmit={(event) => { event.preventDefault(); void createCode(); }}>
++        <label htmlFor="companion-address">Windows Wi-Fi IPv4 address</label>{' '}
++        <input id="companion-address" value={address} onChange={(event) => setAddress(event.target.value)}
++          placeholder="192.168.1.25" required disabled={busy} autoComplete="off" />
++        <p>Run <code>ipconfig</code> on Windows to find the Wi-Fi IPv4 address.</p>
++        <button type="submit" disabled={busy || !address.trim()}>
++          {busy ? 'Generating…' : pairing ? 'Generate new QR code' : 'Pair a phone'}
++        </button>
++      </form>
++      {error && <p role="alert">{error}</p>}
++      {pairing && (seconds > 0 ? (
++        <div>
++          <p>Open Oracle Companion on Android, tap <strong>Scan QR</strong>, then tap <strong>Pair this phone</strong>.</p>
++          <img alt="Oracle Companion pairing QR code" width={320} height={320}
++            style={{ maxWidth: '100%', height: 'auto', background: 'white' }}
++            src={'data:image/svg+xml;base64,' + pairing.image} />
++          <p>Expires in {seconds} seconds.</p>
++        </div>
++      ) : <p role="status">Pairing code expired. Generate a new QR code.</p>)}
++    </section>
++  );
++}

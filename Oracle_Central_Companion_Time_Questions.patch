@@ -1,0 +1,25 @@
+--- a/backend/app/live_answers.py
++++ b/backend/app/live_answers.py
+@@ -267,8 +267,11 @@
+ 
+ def normalize_question(text):
+     query = ' '.join(text.replace('’', "'").split()).rstrip(' ?.!')
+-    query = re.sub(r'^(?:(?:hey|okay|ok) )?oracle[, ]+', '', query, flags=re.I)
+-    return re.sub(r'^(?:please |(?:can|could) you tell me |tell me )', '', query, flags=re.I)
++    return re.sub(
++        r"^(?:(?:hello|hi|hey|okay|ok|oracle)[, !.]+|please |"
++        r"(?:can|could|would) you (?:please )?tell (?:me|e) |tell me )+",
++        "", query, flags=re.I,
++    )
+ 
+ 
+ def live_answer(text, weather_city=None):
+@@ -296,7 +299,7 @@
+         return _weather(match[1] or match[2] or weather_city, ('temperature_2m_max', 'tomorrow'))
+     if match := re.fullmatch(r'what time is (sunrise|sunset)(?: in (.{1,100}?))?(?: (today|tomorrow))?', query, re.I):
+         return _weather(match[2] or weather_city, (match[1].lower(), (match[3] or 'today').lower()))
+-    if re.fullmatch(r"(?:(?:what is|what's|whats) the )?(?:current |local )?time(?: is it)?(?: right now| now)?|what time is it(?: right now| now)?", query, re.I):
++    if re.fullmatch(r"(?:(?:what is|what's|whats) )?(?:the )?(?:current |local )?time(?: is it)?(?: here)?(?: right now| now)?|what time is it(?: right now| now)?", query, re.I):
+         now = datetime.now().astimezone()
+         return f'It’s {now:%I:%M %p} (Oracle Central local time, UTC{now:%z}).'.replace('It’s 0', 'It’s ')
+     if re.fullmatch(r"(?:(?:what is|what's|whats) )?(?:the |today's )?(?:current )?date(?: today)?|what day is it(?: today)?|what is today'?s date", query, re.I):

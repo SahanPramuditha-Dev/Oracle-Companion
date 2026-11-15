@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="oracle_bg">#0C0E11</color>
+    <color name="oracle_canvas">#06090E</color>
+    <color name="oracle_sky">#38BDF8</color>
+    <color name="oracle_indigo">#818CF8</color>
+    <color name="oracle_fg">#E8EBEF</color>
+</resources>

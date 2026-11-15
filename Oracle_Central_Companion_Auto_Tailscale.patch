@@ -1,0 +1,243 @@
+--- a/backend/app/companion_settings.py
++++ b/backend/app/companion_settings.py
+@@ -42,7 +42,7 @@
+ """
+ 
+ 
+-def detect_adapters():
++def detect_adapters(*, tailscale=False):
+     if os.name != "nt":
+         return None
+     try:
+@@ -53,7 +53,12 @@
+         )
+         adapters = [
+             adapter for adapter in json.loads(result.stdout)
+-            if any(ipaddress.IPv4Address(adapter["address"]) in net for net in LAN_NETWORKS)
++            if (
++                (adapter["name"].casefold() == "tailscale"
++                 and ipaddress.IPv4Address(adapter["address"]) in TAILSCALE_NETWORK)
++                if tailscale else
++                any(ipaddress.IPv4Address(adapter["address"]) in net for net in LAN_NETWORKS)
++            )
+         ]
+     except (OSError, subprocess.SubprocessError, ValueError):
+         return None
+@@ -63,6 +68,10 @@
+ class PairingRequest(BaseModel):
+     address: ipaddress.IPv4Address | None = None
+     remote_address: ipaddress.IPv4Address | None = None
++
++
++class RemoteSettingsRequest(BaseModel):
++    automatic: bool
+ 
+ 
+ class CompanionTripRequest(TripShareRequest):
+@@ -78,13 +87,28 @@
+         self.root = Path(__file__).resolve().parents[2]
+         self.state = Path(os.environ.get("LOCALAPPDATA", str(self.root / "data"))) / "OracleCompanion"
+ 
++        self.auto_tailscale = False
++        self.stop_monitor = threading.Event()
++        self.monitor = None
++
+     def restore(self):
++        self.auto_tailscale = (self.state / "tailscale-auto").is_file()
++        try:
++            self.restore_listeners()
++        finally:
++            self.stop_monitor.clear()
++            self.monitor = threading.Thread(target=self.watch_tailscale, daemon=True)
++            self.monitor.start()
++
++    def restore_listeners(self):
+         try:
+             addresses = (self.state / "listener-address").read_text().splitlines()
+         except FileNotFoundError:
+             return
+         with self.lock:
+             for index, value in enumerate(addresses[:2]):
++                if index == 1 and self.auto_tailscale:
++                    continue
+                 try:
+                     address = ipaddress.IPv4Address(value)
+                     networks = (TAILSCALE_NETWORK,) if index == 1 else LAN_NETWORKS
+@@ -93,7 +117,57 @@
+                 except (OSError, ValueError, ImportError):
+                     logging.getLogger(__name__).warning("Companion listener could not be restored.", exc_info=True)
+ 
++    def watch_tailscale(self):
++        while not self.stop_monitor.is_set():
++            self.refresh_tailscale()
++            self.stop_monitor.wait(5)
++
++    def refresh_tailscale(self):
++        if not self.auto_tailscale:
++            return
++        adapters = detect_adapters(tailscale=True)
++        if adapters is None:
++            return
++        with self.lock:
++            if not self.auto_tailscale or self.stop_monitor.is_set():
++                return
++            address = adapters[0]["address"] if adapters else ""
++            if self.remote_address() != address:
++                self.stop_listener("remote_server")
++            if address and (self.server or (self.state / "companion.db").is_file()):
++                try:
++                    self.start_listener(address, remote=True)
++                except (OSError, ImportError, ValueError):
++                    logging.getLogger(__name__).warning(
++                        "Could not start automatic Companion Tailscale listener.", exc_info=True
++                    )
++
++    def configure_remote(self, request: RemoteSettingsRequest):
++        with self.lock:
++            marker = self.state / "tailscale-auto"
++            try:
++                if request.automatic:
++                    self.state.mkdir(parents=True, exist_ok=True)
++                    marker.touch()
++                else:
++                    config = self.state / "listener-address"
++                    if config.is_file():
++                        address = config.read_text().splitlines()[:1]
++                        pending = config.with_suffix(".tmp")
++                        pending.write_text("\n".join(address), encoding="ascii")
++                        pending.replace(config)
++                    marker.unlink(missing_ok=True)
++                    self.stop_listener("remote_server")
++                self.auto_tailscale = request.automatic
++            except OSError as error:
++                raise HTTPException(503, "Could not save Companion remote settings.") from error
++        self.refresh_tailscale()
++        return {"autoTailscale": self.auto_tailscale, "remoteAddress": self.remote_address()}
++
+     def close(self):
++        self.stop_monitor.set()
++        if self.monitor is not None:
++            self.monitor.join()
+         with self.lock:
+             self.stop_listener("remote_server")
+             self.stop_listener("server")
+@@ -115,7 +189,8 @@
+         with self.lock:
+             label = self.gateway.paired_label(pairing_id) if self.gateway and pairing_id else None
+             remote = self.remote_address()
+-        return {"adapters": adapters, "preferred": preferred, "pairedLabel": label, "remoteAddress": remote}
++            automatic = self.auto_tailscale
++        return {"adapters": adapters, "preferred": preferred, "pairedLabel": label, "remoteAddress": remote, "autoTailscale": automatic}
+ 
+     def start_listener(self, address: str, *, remote=False):
+         slot = "remote_server" if remote else "server"
+@@ -163,7 +238,7 @@
+             from qrcode.image.svg import SvgPathImage
+             with self.lock:
+                 self.start_listener(address)
+-                if "remote_address" in request.model_fields_set:
++                if not self.auto_tailscale and "remote_address" in request.model_fields_set:
+                     if remote is None:
+                         self.stop_listener("remote_server")
+                     else:
+@@ -171,7 +246,7 @@
+                 remote_host = self.remote_address()
+                 config = self.state / "listener-address"
+                 pending = config.with_suffix(".tmp")
+-                pending.write_text("\n".join(filter(None, (address, remote_host))), encoding="ascii")
++                pending.write_text("\n".join(filter(None, (address, "" if self.auto_tailscale else remote_host))), encoding="ascii")
+                 pending.replace(config)
+                 gateway = self.server.gateway
+                 code = gateway.issue()
+@@ -206,6 +281,7 @@
+     def router(self):
+         router = APIRouter(prefix="/api/v1/companion")
+         router.add_api_route("/network", self.network, methods=["GET"])
++        router.add_api_route("/remote", self.configure_remote, methods=["POST"])
+         router.add_api_route("/pairing", self.issue, methods=["POST"])
+         router.add_api_route("/devices", self.devices, methods=["GET"])
+         router.add_api_route("/devices/{device_id}", self.revoke, methods=["DELETE"])
+--- a/frontend/src/components/CompanionSettingsPane.tsx
++++ b/frontend/src/components/CompanionSettingsPane.tsx
+@@ -5,12 +5,14 @@
+ import './CompanionSettingsPane.css';
+ 
+ type Adapter = { name: string; address: string };
+-type Network = { adapters: Adapter[] | null; preferred: Adapter | null; pairedLabel: string | null; remoteAddress?: string };
++type Network = { adapters: Adapter[] | null; preferred: Adapter | null; pairedLabel: string | null; remoteAddress?: string; autoTailscale?: boolean };
+ type PairingCode = { image: string; expiresIn: number; address: string; pairingId: string };
+ type Phone = { id: string; label: string; lastSeen: number | null; transport: 'lan' | 'tailscale' | null };
+ 
+ export function CompanionSettingsPane() {
+   const [selection, setSelection] = useState('');
++  const [remoteBusy, setRemoteBusy] = useState(false);
++  const [remoteError, setRemoteError] = useState('');
+   const [remoteInput, setRemoteInput] = useState<string | null>(null);
+   const [manualAddress, setManualAddress] = useState('');
+   const [network, setNetwork] = useState<Network | null>(null);
+@@ -104,6 +106,22 @@
+     return () => window.clearTimeout(timer);
+   }, [pairing, now, seconds]);
+ 
++  async function configureRemote(automatic: boolean) {
++    setRemoteBusy(true);
++    setRemoteError('');
++    try {
++      const result = await localApi<Pick<Network, 'autoTailscale' | 'remoteAddress'>>(
++        'companion/remote', 'POST', { automatic },
++      );
++      setRemoteInput(null);
++      setNetwork(previous => previous ? { ...previous, ...result } : previous);
++    } catch (failure) {
++      setRemoteError(failure instanceof Error ? failure.message : 'Could not save Tailscale settings.');
++    } finally {
++      setRemoteBusy(false);
++    }
++  }
++
+   async function createCode() {
+     setBusy(true);
+     setError('');
+@@ -113,7 +131,7 @@
+       const result = await localApi<PairingCode>(
+         'companion/pairing', 'POST', {
+           ...(address ? { address } : {}),
+-          ...(remoteInput === null ? {} : { remote_address: remoteAddress.trim() || null }),
++          ...(remoteInput === null || network?.autoTailscale ? {} : { remote_address: remoteAddress.trim() || null }),
+         },
+       );
+       const issued = Date.now();
+@@ -181,13 +199,26 @@
+             </div>
+           </details>
+           <div className="companion-settings-field">
+-            <label className="settings-tile-title" htmlFor="companion-remote">Tailscale IPv4 address (optional)</label>
+-            <input className="settings-input" id="companion-remote" value={remoteAddress}
+-              onChange={event => setRemoteInput(event.target.value)} placeholder="100.x.x.x"
+-              disabled={busy} autoComplete="off" spellCheck={false} />
+-            <p className="settings-tile-desc">Join the same Tailscale network on both devices. Generate a QR code to save this setting. Clear the address and generate a new code to disable remote access.</p>
+-          </div>
+-          <button className="settings-option-pill active" type="submit" disabled={busy || !effectiveAddress}>
++            <label className="settings-tile-title">
++              <input type="checkbox" checked={network?.autoTailscale ?? false}
++                disabled={!network || busy || remoteBusy}
++                onChange={event => void configureRemote(event.target.checked)} />
++              {' '}Use Tailscale automatically
++            </label>
++            {network?.autoTailscale ? (
++              <p className="settings-tile-desc" role="status">
++                {network.remoteAddress ? `Listening on ${network.remoteAddress}` : 'Waiting for the Tailscale listener…'}
++              </p>
++            ) : <>
++              <label className="settings-tile-title" htmlFor="companion-remote">Tailscale IPv4 address (optional)</label>
++              <input className="settings-input" id="companion-remote" value={remoteAddress}
++                onChange={event => setRemoteInput(event.target.value)} placeholder="100.x.x.x"
++                disabled={busy || remoteBusy} autoComplete="off" spellCheck={false} />
++              <p className="settings-tile-desc">Join the same Tailscale network on both devices. Generate a QR code to save this setting. Clear the address and generate a new code to disable remote access.</p>
++            </>}
++            {remoteError && <p className="companion-settings-error" role="alert">{remoteError}</p>}
++          </div>
++          <button className="settings-option-pill active" type="submit" disabled={busy || remoteBusy || !effectiveAddress}>
+             <QrCode size={12} aria-hidden="true" />
+             {busy ? 'Generating…' : pairing ? 'Generate new QR code' : 'Generate QR code'}
+           </button>

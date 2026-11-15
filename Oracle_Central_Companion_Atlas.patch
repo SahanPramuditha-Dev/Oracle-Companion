@@ -1,0 +1,75 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -176,6 +176,7 @@
+         return {"pc": self.name, "oracle": True, "model": ready, "action": True,
+                 "modelName": model.get("name") if ready else None,
+                 "chatStreaming": True,
++                "atlasAction": True,
+                 "replyModes": ready and name.split(":", 1)[0].rsplit("/", 1)[-1].lower() == "qwen3"}
+ 
+     def history(self):
+@@ -250,18 +251,24 @@
+         finally:
+             self.generating.release()
+ 
+-    def propose(self, device):
++    def propose(self, device, target="vscode"):
++        if target not in ("vscode", "atlas"):
++            raise Problem(400, "Unknown desktop action.")
++        name = "Atlas" if target == "atlas" else "VS Code"
++        app_id = "http://127.0.0.1:5173/?companionView=atlas" if target == "atlas" else "vscode"
+         token, _ = self.capabilities()
+-        action = local_json(8000, "/api/v1/actions/propose", {"app_id": "vscode"}, token)
++        action = local_json(8000, "/api/v1/actions/propose", {"app_id": app_id}, token)
+         with self.db() as db:
+             db.execute("INSERT INTO actions VALUES (?,?,?,'pending',?)",
+                        (action["id"], device, int(time.time()) + action["expires_in_seconds"],
+-                        "Confirm Open VS Code."))
++                        f"Confirm Open {name}."))
+         return {"id": action["id"], "pc": self.name}
+ 
+     def confirm(self, device, identity):
+         token, _ = self.capabilities()
+         with self.db() as db:
++            pending = db.execute("SELECT message FROM actions WHERE id=? AND owner=?",
++                                 (identity, device)).fetchone()
+             updated = db.execute("UPDATE actions SET status='confirming', message=? "
+                                  "WHERE id=? AND owner=? AND status='pending' AND expires>?",
+                                  ("Waiting for Windows.", identity, device, time.time()))
+@@ -271,7 +278,11 @@
+             result = local_json(8000, f"/api/v1/actions/{identity}/confirm", {}, token)
+             status = result.get("status")
+             if status == "launch_requested":
+-                message = "Windows accepted the VS Code launch request. Window visibility is unverified."
++                message = (
++                    "Windows accepted the Atlas browser launch request. Atlas visibility is unverified."
++                    if pending["message"] == "Confirm Open Atlas."
++                    else "Windows accepted the VS Code launch request. Window visibility is unverified."
++                )
+             else:
+                 status, message = "unknown", "Windows returned an unrecognized launch result."
+         except Problem as error:
+@@ -345,7 +356,7 @@
+                     return self.stream_chat(gateway, identity, text, mode)
+                 return gateway.send(identity, text, mode)
+             if path == "/actions/propose":
+-                return gateway.propose(device)
++                return gateway.propose(device, body.get("target", "vscode"))
+             if path == "/actions/confirm":
+                 return gateway.confirm(device, field(body, "id", 64))
+             if path == "/unpair":
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -465,6 +465,12 @@
+     window.addEventListener('oracle_deactivate_ghost_protocol', exitGhost);
+     window.addEventListener('oracle_activate_focus_protocol', handleFocus);
+     window.addEventListener('oracle_activate_atlas_protocol', handleAtlas);
++    const launchUrl = new URL(window.location.href);
++    if (launchUrl.searchParams.get('companionView') === 'atlas') {
++      launchUrl.searchParams.delete('companionView');
++      window.history.replaceState(window.history.state, '', launchUrl);
++      setIsMapOpen(true);
++    }
+     window.addEventListener('oracle_open_camera', sensors.openCamera);
+     window.addEventListener('oracle_close_camera', sensors.stopCamera);
+     const handleCloseAtlas = () => { setIsMapOpen(false); };

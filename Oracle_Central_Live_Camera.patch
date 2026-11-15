@@ -1,0 +1,21 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -433,7 +433,7 @@
+         if not header.startswith("Bearer ") or len(header) > 128:
+             raise Problem(401, "Pair this phone first.")
+         device = gateway.device(header[7:], getattr(self.server, "transport", "lan"))
+-        if self.command == "POST" and path == "/vision":
++        if self.command == "POST" and path in {"/vision", "/vision/detect"}:
+             body = self.body(175_000)
+             try:
+                 photo = base64.b64decode(field(body, "image", 172_000), validate=True)
+@@ -441,6 +441,9 @@
+                 raise Problem(400, "Invalid photo encoding.") from None
+             if len(photo) > 128_000 or not photo.startswith(b"\xff\xd8"):
+                 raise Problem(415, "Send a JPEG photo up to 128 KB.")
++            if path == "/vision/detect":
++                return local_json(8000, "/api/v1/vision/detect", photo, gateway.api_token(),
++                                  timeout=10, content_type="image/jpeg")
+             prompt = field(body, "prompt", 1000)
+             return local_json(
+                 8000, "/api/v1/vision/ask?" + urlencode({"prompt": prompt}), photo,

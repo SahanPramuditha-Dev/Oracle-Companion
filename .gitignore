@@ -1,0 +1,26 @@
+# Built binaries and packages
+*.apk
+*.aab
+*.idsig
+*.zip
+dump.xml
+
+# Gradle & Build artifacts
+.gradle/
+.gradle-local/
+.kotlin/
+**/build/
+build/
+runtime/
+__pycache__/
+*.pyc
+
+# Android Studio & IDE
+.idea/
+*.iml
+.DS_Store
+
+# Local properties / machine-specific configs
+local.properties
+.externalNativeBuild/
+.cxx/

@@ -1,0 +1,67 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -1,4 +1,7 @@
+ """Oracle Companion LAN gateway and Windows console client."""
++import base64
++import binascii
++from urllib.parse import urlencode
+ import datetime as dt
+ import hashlib
+ import ipaddress
+@@ -42,13 +45,13 @@
+     return hashlib.sha256(value.encode()).hexdigest()
+ 
+ 
+-def local_json(port, path, body=None, token=None, timeout=6):
+-    headers = {"Content-Type": "application/json"}
++def local_json(port, path, body=None, token=None, timeout=6, content_type="application/json"):
++    headers = {"Content-Type": content_type}
+     if token:
+         headers["Authorization"] = f"Bearer {token}"
+     request = urllib.request.Request(
+         f"http://127.0.0.1:{port}{path}",
+-        data=None if body is None else json.dumps(body).encode(),
++        data=None if body is None else body if isinstance(body, bytes) else json.dumps(body).encode(),
+         headers=headers,
+     )
+     try:
+@@ -313,10 +316,10 @@
+     def do_POST(self):
+         self.handle_api()
+ 
+-    def body(self):
++    def body(self, limit=24_000):
+         try:
+             length = int(self.headers.get("Content-Length", "0"))
+-            if not 0 <= length <= 24_000:
++            if not 0 <= length <= limit:
+                 raise Problem(413, "Request is too large.")
+             result = json.loads(self.rfile.read(length) or b"{}")
+             if not isinstance(result, dict):
+@@ -330,13 +333,25 @@
+         if not self.path.startswith(PREFIX + "/"):
+             raise Problem(404, "Unknown operation.")
+         path = self.path[len(PREFIX):]
+-        body = self.body() if self.command == "POST" else {}
+         if self.command == "POST" and path == "/pair":
++            body = self.body()
+             return gateway.pair(field(body, "code", 64), field(body, "label", 60))
+         header = self.headers.get("Authorization", "")
+         if not header.startswith("Bearer ") or len(header) > 128:
+             raise Problem(401, "Pair this phone first.")
+         device = gateway.device(header[7:])
++        if self.command == "POST" and path == "/vision":
++            body = self.body(175_000)
++            try:
++                photo = base64.b64decode(field(body, "image", 172_000), validate=True)
++            except (ValueError, binascii.Error):
++                raise Problem(400, "Invalid photo encoding.") from None
++            if len(photo) > 128_000 or not photo.startswith(b"\xff\xd8"):
++                raise Problem(415, "Send a JPEG photo up to 128 KB.")
++            prompt = field(body, "prompt", 1000)
++            return local_json(8000, "/api/v1/vision/ask?" + urlencode({"prompt": prompt}), photo,
++                              gateway.api_token(), timeout=95, content_type="image/jpeg")
++        body = self.body() if self.command == "POST" else {}
+         if self.command == "GET":
+             if path == "/status":
+                 status = gateway.status()

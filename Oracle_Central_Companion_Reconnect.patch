@@ -1,0 +1,112 @@
+--- a/backend/app/companion_settings.py
++++ b/backend/app/companion_settings.py
+@@ -3,6 +3,7 @@
+ import hashlib
+ import ipaddress
+ import json
++import logging
+ import os
+ import ssl
+ import subprocess
+@@ -65,6 +66,20 @@
+         self.lock = threading.Lock()
+         self.server = None
+         self.gateway = None
++        self.root = Path(__file__).resolve().parents[2]
++        self.state = Path(os.environ.get("LOCALAPPDATA", str(self.root / "data"))) / "OracleCompanion"
++
++    def restore(self):
++        try:
++            address = ipaddress.IPv4Address((self.state / "listener-address").read_text().strip())
++            if any(address in net for net in LAN_NETWORKS):
++                with self.lock:
++                    self.start_listener(str(address))
++        except FileNotFoundError:
++            return
++        except (OSError, ValueError, ImportError):
++            logging.getLogger(__name__).warning("Companion listener could not be restored.", exc_info=True)
++
+ 
+     def close(self):
+         with self.lock:
+@@ -80,6 +95,32 @@
+             label = self.gateway.paired_label(pairing_id) if self.gateway and pairing_id else None
+         return {"adapters": adapters, "preferred": preferred, "pairedLabel": label}
+ 
++    def start_listener(self, address: str):
++        if self.server is None or self.server.server_address[0] != address:
++            gateway = self.gateway or Gateway(self.state, self.root)
++            cert, key = certificate(self.state)
++            pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
++            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++            context.minimum_version = ssl.TLSVersion.TLSv1_2
++            context.load_cert_chain(cert, key)
++            server = ThreadingHTTPServer((address, 8443), Handler)
++            try:
++                server.socket = context.wrap_socket(server.socket, server_side=True,
++                                                    do_handshake_on_connect=False)
++                server.gateway = gateway
++                server.pin = pin
++                if self.gateway is None:
++                    gateway.recover()
++                threading.Thread(target=server.serve_forever, daemon=True).start()
++            except Exception:
++                server.server_close()
++                raise
++            if self.server:
++                self.server.shutdown()
++                self.server.server_close()
++            self.server = server
++            self.gateway = gateway
++
+     def issue(self, request: PairingRequest):
+         if request.address is None:
+             preferred = self.network()["preferred"]
+@@ -94,32 +135,11 @@
+             import qrcode
+             from qrcode.image.svg import SvgPathImage
+             with self.lock:
+-                if self.server is None or self.server.server_address[0] != address:
+-                    root = Path(__file__).resolve().parents[2]
+-                    state = Path(os.environ.get("LOCALAPPDATA", str(root / "data"))) / "OracleCompanion"
+-                    gateway = self.gateway or Gateway(state, root)
+-                    cert, key = certificate(state)
+-                    pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
+-                    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+-                    context.minimum_version = ssl.TLSVersion.TLSv1_2
+-                    context.load_cert_chain(cert, key)
+-                    server = ThreadingHTTPServer((address, 8443), Handler)
+-                    try:
+-                        server.socket = context.wrap_socket(server.socket, server_side=True,
+-                                                            do_handshake_on_connect=False)
+-                        server.gateway = gateway
+-                        server.pin = pin
+-                        if self.gateway is None:
+-                            gateway.recover()
+-                        threading.Thread(target=server.serve_forever, daemon=True).start()
+-                    except Exception:
+-                        server.server_close()
+-                        raise
+-                    if self.server:
+-                        self.server.shutdown()
+-                        self.server.server_close()
+-                    self.server = server
+-                    self.gateway = gateway
++                self.start_listener(address)
++                config = self.state / "listener-address"
++                pending = config.with_suffix(".tmp")
++                pending.write_text(address, encoding="ascii")
++                pending.replace(config)
+                 gateway = self.server.gateway
+                 code = gateway.issue()
+                 payload = json.dumps({"v": 1, "host": address, "port": 8443,
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -79,6 +79,7 @@
+     async def lifespan(app):
+         try:
+             async with ollama.lifespan() if isinstance(ollama, Ollama) else nullcontext():
++                await run_in_threadpool(companion.restore)
+                 yield
+         finally:
+             await run_in_threadpool(companion.close)

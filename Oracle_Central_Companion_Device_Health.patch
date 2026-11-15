@@ -1,0 +1,23 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -174,10 +174,20 @@
+         except Problem:
+             ready = False
+         return {"pc": self.name, "oracle": True, "model": ready, "action": True,
++                "deviceHealth": self.device_health(),
+                 "modelName": model.get("name") if ready else None,
+                 "chatStreaming": True,
+                 "atlasAction": True,
+                 "replyModes": ready and name.split(":", 1)[0].rsplit("/", 1)[-1].lower() == "qwen3"}
++
++    def device_health(self):
++        try:
++            import psutil
++            cpu = psutil.cpu_percent(interval=0.05)
++            ram = psutil.virtual_memory().percent
++        except (ImportError, OSError, RuntimeError):
++            return None
++        return {"cpuPercent": cpu, "ramPercent": ram, "sampledAt": int(time.time())}
+ 
+     def history(self):
+         with self.db() as db:

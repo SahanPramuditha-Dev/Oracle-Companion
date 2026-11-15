@@ -1,0 +1,92 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -596,6 +596,9 @@
+         if not header.startswith("Bearer ") or len(header) > 128:
+             raise Problem(401, "Pair this phone first.")
+         device = gateway.device(header[7:], getattr(self.server, "transport", "lan"))
++        if path == "/device/performance" and self.command == "GET":
++            from .companion_performance import performance_snapshot
++            return performance_snapshot()
+         if path == "/device/controls" and self.command in {"GET", "POST"}:
+             if getattr(self.server, "transport", "lan") != "lan":
+                 raise Problem(403, "PC controls require a local connection.")
+--- /dev/null
++++ b/backend/app/companion_performance.py
+@@ -0,0 +1,77 @@
++"""Read-only telemetry for the paired PC performance page."""
++import json
++import os
++import shutil
++import subprocess
++import threading
++import time
++from pathlib import Path
++
++try:
++    import psutil
++except ImportError:
++    psutil = None
++
++_lock = threading.Lock()
++_previous = None
++_snapshot = None
++_sampled = 0.0
++
++
++def gpu_usage():
++    if os.name != "nt":
++        return None
++    exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
++    script = (
++        "$ErrorActionPreference='Stop'; "
++        "$rows = Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine; "
++        "$rows | Where-Object Name -Match 'engtype_3D$' | "
++        "Select-Object Name, UtilizationPercentage | ConvertTo-Json -Compress"
++    )
++    try:
++        result = subprocess.run([str(exe), "-NoProfile", "-NonInteractive", "-Command", script],
++                                capture_output=True, text=True, timeout=4,
++                                creationflags=subprocess.CREATE_NO_WINDOW, check=True)
++        rows = json.loads(result.stdout or "null")
++        if isinstance(rows, dict):
++            rows = [rows]
++        engines = {}
++        for row in rows or []:
++            # Multiple processes can contribute to the same hardware engine.
++            engine = row["Name"].partition("_luid_")[2]
++            if engine:
++                engines[engine] = engines.get(engine, 0) + int(row["UtilizationPercentage"])
++        return min(100, max(engines.values())) if engines else None
++    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
++        return None
++
++
++def performance_snapshot():
++    global _previous, _snapshot, _sampled
++    with _lock:
++        now = time.monotonic()
++        if _snapshot is not None and now - _sampled < 5:
++            return _snapshot
++        output = {}
++        if psutil is not None:
++            memory = psutil.virtual_memory()
++            output["memory"] = {"used": memory.total - memory.available, "total": memory.total}
++            counters = psutil.net_io_counters()
++            if counters is not None:
++                if _previous is not None:
++                    stamp, rx, tx = _previous
++                    elapsed = now - stamp
++                    if 0 < elapsed <= 30 and counters.bytes_recv >= rx and counters.bytes_sent >= tx:
++                        output["network"] = {"down": round((counters.bytes_recv - rx) / elapsed),
++                                             "up": round((counters.bytes_sent - tx) / elapsed)}
++                _previous = (now, counters.bytes_recv, counters.bytes_sent)
++        try:
++            drive = Path(os.environ.get("SystemDrive", "C:") + "/") if os.name == "nt" else Path("/")
++            disk = shutil.disk_usage(drive)
++            output["storage"] = {"used": disk.used, "total": disk.total}
++        except OSError:
++            pass
++        output["gpu3d"] = gpu_usage()
++        _snapshot = output
++        _sampled = time.monotonic()
++        return output

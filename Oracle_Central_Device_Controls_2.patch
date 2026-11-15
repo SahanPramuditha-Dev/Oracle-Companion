@@ -1,0 +1,206 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -1,5 +1,6 @@
+ """Oracle Companion LAN gateway and Windows console client."""
+ import base64
++import ctypes
+ import datetime as dt
+ import hashlib
+ import ipaddress
+@@ -10,6 +11,7 @@
+ import socket
+ import sqlite3
+ import ssl
++import subprocess
+ import threading
+ import time
+ import urllib.error
+@@ -114,6 +116,8 @@
+         self.oracle = oracle
+         self.name = socket.gethostname()
+         self.generating = threading.Lock()
++        self.controls_lock = threading.Lock()
++        self.scheduled_shutdown = None
+         directory.mkdir(parents=True, exist_ok=True)
+         with self.db() as db:
+             db.executescript("""
+@@ -388,6 +392,111 @@
+             db.execute("UPDATE actions SET status=?, message=? WHERE id=?", (status, message, identity))
+         return {"status": status, "message": message}
+ 
++    def _windows_power(self, action):
++        # Use a zero Windows timeout so Windows does not implicitly force-close apps.
++        binary = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "shutdown.exe")
++        flag = "/r" if action == "restart" else "/s"
++        try:
++            result = subprocess.run([binary, flag, "/t", "0"], capture_output=True,
++                                    timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
++        except (OSError, subprocess.TimeoutExpired):
++            raise Problem(503, "Windows did not confirm the power request.") from None
++        if result.returncode:
++            raise Problem(409, "Windows rejected the power request.")
++
++    def _record_control(self, device, status, message):
++        with self.db() as db:
++            db.execute("INSERT INTO actions VALUES (?,?,?,?,?)",
++                       (str(uuid.uuid4()), device, int(time.time()), status, message))
++
++    def _run_scheduled_shutdown(self, timer_id):
++        with self.controls_lock:
++            pending = self.scheduled_shutdown
++            if pending is None or pending["id"] != timer_id:
++                return
++            self.scheduled_shutdown = None
++            with self.db() as db:
++                still_paired = db.execute("SELECT 1 FROM devices WHERE id=?", (pending["owner"],)).fetchone()
++            if not still_paired:
++                return
++            try:
++                self._windows_power("shutdown")
++            except Problem as error:
++                self._record_control(pending["owner"], "failed", error.message)
++            else:
++                self._record_control(pending["owner"], "requested", "Windows accepted the scheduled shutdown request.")
++
++    def device_controls(self, device, command=None):
++        if os.name != "nt":
++            if command is not None:
++                raise Problem(501, "PC controls require Windows.")
++            return {"supported": False}
++        from .companion_windows import battery_status, master_volume
++        with self.controls_lock:
++            pending = self.scheduled_shutdown
++            if command is None:
++                try:
++                    volume = master_volume()
++                except OSError:
++                    volume = None
++                return {"supported": True, "scheduled": {"due": pending["due"]} if pending else None,
++                        "canCancel": bool(pending and pending["owner"] == device),
++                        "battery": battery_status(), "volume": volume}
++            action = command.get("action")
++            if not isinstance(action, str) or action not in {
++                "lock", "previous", "play_pause", "next", "volume_down", "volume_up", "mute",
++                "shutdown", "restart", "schedule", "cancel", "set_volume"
++            }:
++                raise Problem(400, "Unknown device control.")
++            if action == "set_volume":
++                percent = command.get("percent")
++                if type(percent) is not int or not 0 <= percent <= 100:
++                    raise Problem(400, "Choose a volume from 0 to 100 percent.")
++                try:
++                    applied = master_volume(percent)
++                except OSError:
++                    raise Problem(503, "Windows audio endpoint is unavailable.") from None
++                message = f"Windows volume is {applied['percent']}%."
++                self._record_control(device, "requested", message)
++                return {"message": message, "volume": applied}
++            if action == "cancel":
++                if not pending or pending["owner"] != device:
++                    raise Problem(409, "No shutdown from this phone is pending.")
++                pending["timer"].cancel()
++                self.scheduled_shutdown = None
++                message = "Scheduled shutdown canceled."
++            elif action == "schedule":
++                if pending:
++                    raise Problem(409, "A shutdown is already scheduled.")
++                minutes = command.get("minutes")
++                if type(minutes) is not int or not 1 <= minutes <= 120:
++                    raise Problem(400, "Choose a delay from 1 to 120 minutes.")
++                timer_id = str(uuid.uuid4())
++                timer = threading.Timer(minutes * 60, self._run_scheduled_shutdown, args=(timer_id,))
++                timer.daemon = True
++                self.scheduled_shutdown = {"id": timer_id, "due": int(time.time()) + minutes * 60,
++                                           "timer": timer, "owner": device}
++                timer.start()
++                message = f"Shutdown scheduled in {minutes} minutes."
++            elif action in ("shutdown", "restart"):
++                if pending:
++                    raise Problem(409, "Cancel the scheduled shutdown before requesting another power action.")
++                self._windows_power(action)
++                message = "Windows accepted the power request."
++            elif action == "lock":
++                if not ctypes.windll.user32.LockWorkStation():
++                    raise Problem(409, "Windows could not start locking the current session.")
++                message = "Windows accepted the lock request."
++            else:
++                key = {"previous": 0xB1, "play_pause": 0xB3, "next": 0xB0,
++                       "volume_down": 0xAE, "volume_up": 0xAF, "mute": 0xAD}[action]
++                user32 = ctypes.windll.user32
++                user32.keybd_event(key, 0, 0, 0)
++                user32.keybd_event(key, 0, 2, 0)
++                message = "Media key sent to Windows."
++            self._record_control(device, "requested", message)
++            return {"message": message}
++
+     def activity(self, device):
+         with self.db() as db:
+             rows = db.execute("SELECT status,message FROM actions WHERE owner=? AND status!='pending' "
+@@ -433,6 +542,10 @@
+         if not header.startswith("Bearer ") or len(header) > 128:
+             raise Problem(401, "Pair this phone first.")
+         device = gateway.device(header[7:], getattr(self.server, "transport", "lan"))
++        if path == "/device/controls" and self.command in {"GET", "POST"}:
++            if getattr(self.server, "transport", "lan") != "lan":
++                raise Problem(403, "PC controls require a local connection.")
++            return gateway.device_controls(device, self.body(2048) if self.command == "POST" else None)
+         if self.command == "POST" and path in {
+             "/vision", "/vision/detect", "/vision/people", "/vision/read", "/vision/product",
+         }:
+--- /dev/null
++++ b/backend/app/companion_windows.py
+@@ -0,0 +1,54 @@
++import ctypes as c
++import uuid
++from ctypes import wintypes as w
++
++class PowerStatus(c.Structure):
++    _fields_ = [("ac", c.c_ubyte), ("flags", c.c_ubyte), ("percent", c.c_ubyte),
++                ("saver", c.c_ubyte), ("remaining", w.DWORD), ("full", w.DWORD)]
++
++def battery_status():
++    status = PowerStatus()
++    if not c.windll.kernel32.GetSystemPowerStatus(c.byref(status)):
++        return None
++    if status.flags == 255 or status.flags & 128 or status.percent > 100:
++        return None
++    return {"percent": status.percent, "pluggedIn": status.ac == 1,
++            "charging": bool(status.flags & 8)}
++
++def guid(value):
++    return (c.c_ubyte * 16).from_buffer_copy(uuid.UUID(value).bytes_le)
++
++def invoke(pointer, index, *args, returns=c.c_long):
++    table = c.cast(pointer, c.POINTER(c.POINTER(c.c_void_p))).contents
++    parameters = [type(arg) for arg in args]
++    fn = c.WINFUNCTYPE(returns, c.c_void_p, *parameters)(table[index])
++    return fn(pointer, *args)
++
++def check(result):
++    if result < 0:
++        raise OSError(f"Core Audio failed ({result & 0xffffffff:#010x})")
++
++def master_volume(level=None):
++    ole = c.windll.ole32
++    result = ole.CoInitializeEx(None, 0)
++    check(result)
++    enumerator, device, endpoint = (c.c_void_p() for _ in range(3))
++    try:
++        clsid = guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
++        iid = guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
++        check(ole.CoCreateInstance(c.byref(clsid), None, 1, c.byref(iid), c.byref(enumerator)))
++        check(invoke(enumerator, 4, c.c_int(0), c.c_int(1), c.pointer(device)))
++        iid = guid("5CDF2C82-841E-4546-9722-0CF74078229A")
++        check(invoke(device, 3, c.pointer(iid), w.DWORD(1), c.c_void_p(), c.pointer(endpoint)))
++        if level is not None:
++            check(invoke(endpoint, 7, c.c_float(level / 100), c.c_void_p()))
++        scalar = c.c_float()
++        muted = w.BOOL()
++        check(invoke(endpoint, 9, c.pointer(scalar)))
++        check(invoke(endpoint, 15, c.pointer(muted)))
++        return {"percent": round(scalar.value * 100), "muted": bool(muted.value)}
++    finally:
++        for pointer in (endpoint, device, enumerator):
++            if pointer:
++                invoke(pointer, 2, returns=w.ULONG)
++        ole.CoUninitialize()

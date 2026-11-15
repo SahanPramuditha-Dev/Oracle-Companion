@@ -1,0 +1,11 @@
+--- a/backend/app/live_answers.py
++++ b/backend/app/live_answers.py
+@@ -466,7 +466,7 @@
+         return _weather(match[2] or weather_city, (match[1].lower(), (match[3] or 'today').lower()))
+     if re.fullmatch(r"(?:(?:what is|what's|whats) )?(?:the )?(?:current |local )?time(?: is it)?(?: right now| now| here)?|what time is it(?: right now| now| here)?", query, re.I):
+         now = datetime.now().astimezone()
+-        return f'It’s {now:%I:%M %p} (Oracle Central local time, UTC{now:%z}).'.replace('It’s 0', 'It’s ')
++        return f'It’s {now:%I:%M %p}.'.replace('It’s 0', 'It’s ')
+     if re.fullmatch(r"(?:(?:what is|what's|whats) )?(?:the |today's )?(?:current )?date(?: today)?|what day is it(?: today)?|(?:what is|what's|whats) today'?s date", query, re.I):
+         now = datetime.now().astimezone()
+         return f'Today is {now:%A, %B} {now.day}, {now.year} (Oracle Central local date).'

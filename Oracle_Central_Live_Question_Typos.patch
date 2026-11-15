@@ -1,0 +1,57 @@
+--- a/backend/app/live_answers.py
++++ b/backend/app/live_answers.py
+@@ -310,12 +310,13 @@
+ 
+ def normalize_question(text):
+     query = ' '.join(text.replace('’', "'").split()).rstrip(' ?.!')
+-    query = re.sub(r'^(?:(?:hey|okay|ok) )?oracle[, ]+', '', query, flags=re.I)
+-    return re.sub(r'^(?:please |(?:can|could) you tell me |tell me )', '', query, flags=re.I)
++    query = re.sub(r'^(?:(?:hello|hi|hey|okay|ok|oracle)[, !.]+)+', '', query, flags=re.I)
++    return re.sub(r'^(?:please |(?:can|could|would) you (?:please )?tell (?:me|e) |tell me )+', '', query, flags=re.I)
+ 
+ 
+ # Match the question wording and leave city names, values and units untouched.
+ QUESTION_PREFIXES = (
++    'the time', 'the current time', 'the date', "whats todays date",
+     'what time is it', 'what is the current time', 'what is the time', "what's the time",
+     'what is the date', "what's the date", 'what day is it', "what is today's date",
+     "what's the weather", 'what is the weather', 'how is the weather',
+@@ -363,7 +364,7 @@
+         for actual, expected in zip(lower, words):
+             if actual == expected or actual == expected.replace("'", ''):
+                 continue
+-            if (len(expected) < 3 or actual in QUESTION_WORDS or not _one_edit(actual, expected)):
++            if (len(expected) < 3 or actual in QUESTION_WORDS or not _one_edit(actual, expected.replace("'", ""))):
+                 break
+             edits += 1
+         else:
+@@ -375,6 +376,9 @@
+     if sum((length, edits) == (size, score) for length, edits, _ in matches) > 1:
+         return text
+     suffix = tokens[size:]
++    if prefix in ('the time', 'the current time', 'what time is it', 'what is the current time',
++                  'what is the time', "what's the time") and [word.lower() for word in suffix] == ['rn']:
++        suffix = ['right now']
+     # A final day qualifier can be corrected when it cannot be part of a place.
+     if len(suffix) == 1 and prefix in ("what's the weather", 'what is the weather',
+                                       'will it rain', "what's on my calendar",
+@@ -460,13 +464,17 @@
+         return _weather(match[1] or match[2] or weather_city, ('temperature_2m_max', 'tomorrow'))
+     if match := re.fullmatch(r'what time is (sunrise|sunset)(?: in (.{1,100}?))?(?: (today|tomorrow))?', query, re.I):
+         return _weather(match[2] or weather_city, (match[1].lower(), (match[3] or 'today').lower()))
+-    if re.fullmatch(r"(?:(?:what is|what's|whats) the )?(?:current |local )?time(?: is it)?(?: right now| now| here)?|what time is it(?: right now| now| here)?", query, re.I):
++    if re.fullmatch(r"(?:(?:what is|what's|whats) )?(?:the )?(?:current |local )?time(?: is it)?(?: right now| now| here)?|what time is it(?: right now| now| here)?", query, re.I):
+         now = datetime.now().astimezone()
+         return f'It’s {now:%I:%M %p} (Oracle Central local time, UTC{now:%z}).'.replace('It’s 0', 'It’s ')
+-    if re.fullmatch(r"(?:(?:what is|what's|whats) )?(?:the |today's )?(?:current )?date(?: today)?|what day is it(?: today)?|what is today'?s date", query, re.I):
++    if re.fullmatch(r"(?:(?:what is|what's|whats) )?(?:the |today's )?(?:current )?date(?: today)?|what day is it(?: today)?|(?:what is|what's|whats) today'?s date", query, re.I):
+         now = datetime.now().astimezone()
+         return f'Today is {now:%A, %B} {now.day}, {now.year} (Oracle Central local date).'
+     match = CURRENT_WEATHER.fullmatch(query)
++    if not match:
++        shorthand = re.fullmatch(r'([a-z]{5,8}) in (.{1,100})', query, re.I)
++        if shorthand and (shorthand[1].lower() == 'weather' or _one_edit(shorthand[1].lower(), 'weather')):
++            return _weather(shorthand[2])
+     if match:
+         return _weather(match[1] or weather_city)
+     return None

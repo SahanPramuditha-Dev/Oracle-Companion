@@ -1,0 +1,46 @@
+--- a/backend/app/companion_gateway.py
++++ b/backend/app/companion_gateway.py
+@@ -164,7 +164,8 @@
+         except Problem:
+             ready = False
+         return {"pc": self.name, "oracle": True, "model": ready, "action": True,
+-                "modelName": model.get("name") if ready else None}
++                "modelName": model.get("name") if ready else None,
++                "replyModes": ready and name.split(":", 1)[0].rsplit("/", 1)[-1].lower() == "qwen3"}
+ 
+     def history(self):
+         with self.db() as db:
+@@ -173,7 +174,9 @@
+             ).fetchall()
+         return {"messages": [dict(row) for row in reversed(rows)]}
+ 
+-    def send(self, identity, text):
++    def send(self, identity, text, mode="quick"):
++        if mode not in ("quick", "deep"):
++            raise Problem(400, "Invalid reply mode.")
+         if not self.generating.acquire(blocking=False):
+             raise Problem(409, "Oracle is answering another message. Try again shortly.")
+         try:
+@@ -199,8 +202,11 @@
+                 context = [{"role": "assistant" if row["role"] == "model" else "user",
+                             "content": row["text"][:4000]} for row in reversed(rows)]
+                 context.append({"role": "user", "content": text})
+-                result = local_json(self.ollama_port(), "/api/chat", {"model": model["name"], "stream": False,
+-                                    "messages": context, "options": {"num_predict": 512}}, timeout=80)
++                payload = {"model": model["name"], "stream": False, "messages": context,
++                           "options": {"num_predict": 1024 if mode == "deep" else 512}}
++                if model["name"].split(":", 1)[0].rsplit("/", 1)[-1].lower() == "qwen3":
++                    payload["think"] = mode == "deep"
++                result = local_json(self.ollama_port(), "/api/chat", payload, timeout=80)
+                 reply = result.get("message", {}).get("content", "").strip()
+                 if not reply:
+                     raise Problem(502, "The local model returned an empty answer.")
+@@ -305,7 +311,7 @@
+                     identity = str(uuid.UUID(field(body, "id", 36)))
+                 except ValueError:
+                     raise Problem(400, "Invalid message ID.") from None
+-                return gateway.send(identity, field(body, "text", 4000))
++                return gateway.send(identity, field(body, "text", 4000), body.get("mode", "quick"))
+             if path == "/actions/propose":
+                 return gateway.propose(device)
+             if path == "/actions/confirm":

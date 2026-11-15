@@ -1,0 +1,66 @@
+--- a/frontend/src/components/ConversationHUD.tsx
++++ b/frontend/src/components/ConversationHUD.tsx
+@@ -440,6 +440,24 @@
+         window.dispatchEvent(new CustomEvent('oracle_lock_admin'));
+         return;
+       }
++      // Built-in destinations take priority over customizable protocol aliases.
++      const voiceIntent = interpretVoiceIntent(textToSend);
++      if (voiceIntent.name !== 'unknown') {
++        setInput('');
++        setMode('ready');
++        onWake?.();
++        window.dispatchEvent(new CustomEvent(commandEvents[voiceIntent.name]));
++        const label = voiceIntent.name === 'open_settings' ? 'Open Settings' : taughtActionLabels[voiceIntent.name];
++        recordCommandAttempt(transcript, textToSend, label, 'Action requested');
++        return;
++      }
++      if (voiceIntent.requiresClarification) {
++        setVadStatus('I heard an ambiguous command. Please say the specific destination, such as “open map”.');
++        recordCommandAttempt(transcript, textToSend, 'Ambiguous command', 'Asked for a destination');
++        setInput(textToSend);
++        setMode('ready');
++        return;
++      }
+       const allProtocols = getStoredProtocols();
+ 
+       // Check dynamic protocols (built-in + customized + user created) with strict command matching
+@@ -472,21 +490,6 @@
+       if (parseAtlasSpatialCommand(textToSend) || /^(?:(?:(?:hey|ok|okay) )?oracle[, ]+)?(?:please )?(?:route (?:from|to) .+|navigate to .+|show me .+ on (?:the )?map|(?:find|show)(?: me)? (?:the )?(?:nearest|nearby) (?:hospitals?|pharmacy|pharmacies|fuel|food|atms?)|where did i park)[?.!]*$/i.test(textToSend)) {
+         setInput('');
+         window.dispatchEvent(new CustomEvent('oracle_atlas_command', { detail: textToSend }));
+-        return;
+-      }
+-      const voiceIntent = interpretVoiceIntent(textToSend);
+-      if (voiceIntent.name !== 'unknown') {
+-        setInput('');
+-        window.dispatchEvent(new CustomEvent(commandEvents[voiceIntent.name]));
+-        const label = voiceIntent.name === 'open_settings' ? 'Open Settings' : taughtActionLabels[voiceIntent.name];
+-        recordCommandAttempt(transcript, textToSend, label, 'Action requested');
+-        return;
+-      }
+-      if (voiceIntent.requiresClarification) {
+-        setVadStatus('I heard an ambiguous command. Please say the specific destination, such as “open map”.');
+-        recordCommandAttempt(transcript, textToSend, 'Ambiguous command', 'Asked for a destination');
+-        setInput(textToSend);
+-        setMode('ready');
+         return;
+       }
+       if (/^(?:please\s+)?(?:open|show|launch|view)?\s*(?:the\s+)?(?:workspace|records)$/i.test(normPrompt)) {
+--- a/frontend/src/utils/voiceIntent.ts
++++ b/frontend/src/utils/voiceIntent.ts
+@@ -23,11 +23,12 @@
+ const stripPolitePrefix = (text: string): string =>
+   text
+     .replace(/^(?:(?:hey|hi|ok|okay)\s+)?oracle(?:\s+|$)/i, '')
+-    .replace(/^(?:please|can you|could you)\s+/i, '')
++    .replace(/^(?:(?:please|can you|could you|would you)\s+)+/i, '')
++    .replace(/\s+please$/i, '')
+     .trim();
+ 
+ const commands = [
+-  ['open_map', /^(?:(?:open|show|display|launch|view|activate|enter) )?(?:the )?(?:tactical )?(?:geo )?(?:map|maps|atlas|spatial intelligence)$/],
++  ['open_map', /^(?:(?:open|show|display|launch|view|activate|enter|bring up) )?(?:the )?(?:tactical )?(?:geo )?(?:map|maps|atlas|spatial intelligence)(?: (?:view|mode))?$/],
+   ['close_map', /^(?:close|hide|exit|minimize) (?:the )?(?:tactical )?(?:geo )?(?:map|maps|atlas)$/],
+   ['open_settings', /^(?:open|show|display|launch|view) (?:the )?(?:system )?settings$/],
+   ['open_camera', /^(?:open|show|start|turn on) (?:the )?camera$/],

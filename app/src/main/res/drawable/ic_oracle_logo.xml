@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- Central Celestial Sphere -->
+    <path
+        android:strokeColor="#C5D3E3"
+        android:strokeWidth="1.8"
+        android:strokeAlpha="0.9"
+        android:pathData="M24,24m-16.5,0a16.5,16.5 0 1,1 33,0a16.5,16.5 0 1,1 -33,0" />
+
+    <!-- Rotated Orbital Ring (-34 deg) & Beacon -->
+    <group
+        android:pivotX="24"
+        android:pivotY="24"
+        android:rotation="-34">
+        <!-- Orbital Ellipse -->
+        <path
+            android:strokeColor="#818CF8"
+            android:strokeWidth="1.6"
+            android:strokeAlpha="0.8"
+            android:pathData="M2.6,24a21.4,7 0 1,0 42.8,0a21.4,7 0 1,0 -42.8,0" />
+        <!-- Orbiting Beacon -->
+        <path
+            android:fillColor="#00F3FF"
+            android:pathData="M40.8,24m-3,0a3,3 0 1,1 6,0a3,3 0 1,1 -6,0" />
+    </group>
+</vector>
